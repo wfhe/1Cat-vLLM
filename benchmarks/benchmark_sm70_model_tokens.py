@@ -909,6 +909,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
         "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD",
         True,
     )
+    e5m2_batch_wide_load = _env_bool(
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD",
+        True,
+    )
     decode_fp8_xqa_min_seq_len = _env_int(
         "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
         16384,
@@ -1020,6 +1024,10 @@ def _sm70_attention_policy(kv_cache_dtype: Any) -> dict[str, Any]:
             "VLLM_FLASH_V100_XQA_E5M2_PAIR_LOAD"
         ),
         "e5m2_pair_load_effective": e5m2_pair_load,
+        "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD": os.environ.get(
+            "VLLM_FLASH_V100_XQA_E5M2_BATCH_WIDE_LOAD"
+        ),
+        "e5m2_batch_wide_load_effective": e5m2_batch_wide_load,
         "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": os.environ.get(
             "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN"
         ),
