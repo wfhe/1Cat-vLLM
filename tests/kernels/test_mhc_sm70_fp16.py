@@ -232,7 +232,7 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
         tile_n=tile_n,
         n_splits=n_splits,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     torch.testing.assert_close(candidate_residual, baseline_residual, rtol=0, atol=0)
     torch.testing.assert_close(candidate_gemm, baseline_gemm, rtol=0, atol=0)

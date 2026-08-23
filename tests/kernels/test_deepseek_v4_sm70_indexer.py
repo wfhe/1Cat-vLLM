@@ -41,8 +41,8 @@ def _reference_index_logits(
     does NOT factor to (sum_h weights[t, h] * q[t, h]) . k[s] - the relu sits
     between the weighting and the head sum.
     """
-    per_head = torch.einsum("thd,sd->ths", q.float(), k.float())
-    return torch.einsum("ths,th->ts", torch.relu(per_head), weights.float())
+    per_head = torch.einsum("mhd,nd->mhn", q.float(), k.float())
+    return torch.einsum("mhn,mh->mn", torch.relu(per_head), weights.float())
 
 
 def _reference_factored_logits(
@@ -264,7 +264,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
     with torch.cuda.graph(graph, stream=capture_stream):
         candidate = candidate_call()
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
         expected_topk = torch.topk(baseline[row, :row_len], 512).indices.sort().values
@@ -283,7 +283,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(monkeypatch)
         q, cache, weights, seq_lens, block_table, graph_width
     )
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for row, row_len in enumerate(seq_lens.reshape(-1).tolist()):
         expected_topk = (
             torch.topk(replay_baseline[row, :row_len], 512).indices.sort().values

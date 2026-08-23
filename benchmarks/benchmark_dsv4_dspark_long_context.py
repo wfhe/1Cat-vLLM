@@ -13,13 +13,13 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
-import re
 import statistics
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import regex as re
 from transformers import AutoTokenizer
 
 _PROFILE_INTERVAL_MARKER = "SM70 spec runner profile interval_avg_ms "

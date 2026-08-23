@@ -11,7 +11,6 @@ import hashlib
 import http.client
 import json
 import os
-import re
 import resource
 import statistics
 import subprocess
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import regex as re
 from transformers import AutoTokenizer
 
 NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}

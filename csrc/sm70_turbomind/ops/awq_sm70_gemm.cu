@@ -1082,14 +1082,12 @@ bool mxfp4_moe_grouped_m8_enabled() {
 }
 
 bool mxfp4_moe_grouped_verifier_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
-  const char* raw =
-      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
+  const char* raw = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
@@ -2414,8 +2412,7 @@ __global__ void fp8_sm70_dequantize_kernel(
   }
 
   const int words_per_n_tile = k / kFp8QuantValuesPerWord;
-  const int n_in_tile =
-      static_cast<int>(word_index % kFp8OutputColumnsPerTile);
+  const int n_in_tile = static_cast<int>(word_index % kFp8OutputColumnsPerTile);
   const int64_t tile_word = word_index / kFp8OutputColumnsPerTile;
   const int k_word = static_cast<int>(tile_word % words_per_n_tile);
   const int n_tile = static_cast<int>(tile_word / words_per_n_tile);
@@ -2424,10 +2421,12 @@ __global__ void fp8_sm70_dequantize_kernel(
   const int group = k_base / group_size;
 
   const uint2 quant = reinterpret_cast<const uint2*>(packed_weight)[word_index];
-  const auto& quant_lo = reinterpret_cast<
-      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.x);
-  const auto& quant_hi = reinterpret_cast<
-      const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(quant.y);
+  const auto& quant_lo =
+      reinterpret_cast<const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(
+          quant.x);
+  const auto& quant_hi =
+      reinterpret_cast<const turbomind::Array<turbomind::fp8_e4m3_t, 4>&>(
+          quant.y);
   const auto half_lo = turbomind::cvt_f16x4_e4m3(quant_lo);
   const auto half_hi = turbomind::cvt_f16x4_e4m3(quant_hi);
   const __half scale = packed_scales[static_cast<int64_t>(group) * n + col];
@@ -2452,10 +2451,8 @@ __global__ void fp8_sm70_dequantize_kernel(
       __hmul(half_hi[3], scale);
 }
 
-void fp8_sm70_dequantize_out(torch::Tensor output,
-                             torch::Tensor packed_weight,
-                             torch::Tensor packed_scales,
-                             int64_t group_size) {
+void fp8_sm70_dequantize_out(torch::Tensor output, torch::Tensor packed_weight,
+                             torch::Tensor packed_scales, int64_t group_size) {
   TORCH_CHECK(
       output.is_cuda() && packed_weight.is_cuda() && packed_scales.is_cuda(),
       "SM70 FP8 prefill dequant expects CUDA tensors.");
@@ -2475,8 +2472,7 @@ void fp8_sm70_dequantize_out(torch::Tensor output,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   const int64_t k = output.size(0);
   const int64_t n = output.size(1);
-  TORCH_CHECK(k % group_size == 0 &&
-                  k % kFp8QuantValuesPerWord == 0 &&
+  TORCH_CHECK(k % group_size == 0 && k % kFp8QuantValuesPerWord == 0 &&
                   n % kFp8OutputColumnsPerTile == 0,
               "SM70 FP8 prefill dequant shape alignment mismatch.");
   TORCH_CHECK(packed_weight.numel() == k * n,
@@ -2489,15 +2485,14 @@ void fp8_sm70_dequantize_out(torch::Tensor output,
               "SM70 FP8 prefill tensors must share a device.");
 
   const int64_t words = packed_weight.numel() / kFp8QuantValuesPerWord;
-  const int blocks = static_cast<int>(
-      (words + kFp8PrefillDequantThreads - 1) / kFp8PrefillDequantThreads);
+  const int blocks = static_cast<int>((words + kFp8PrefillDequantThreads - 1) /
+                                      kFp8PrefillDequantThreads);
   fp8_sm70_dequantize_kernel<<<blocks, kFp8PrefillDequantThreads, 0,
                                at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
       packed_weight.data_ptr<uint8_t>(),
       reinterpret_cast<const __half*>(packed_scales.data_ptr<at::Half>()),
-      static_cast<int>(k), static_cast<int>(n),
-      static_cast<int>(group_size));
+      static_cast<int>(k), static_cast<int>(n), static_cast<int>(group_size));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -7533,10 +7528,9 @@ void mxfp4_moe_gemm_sm70_out_impl(
   // expert segments can contain multiple rows and have graph-dynamic empty
   // tails, so retain the single-group dispatch choice while letting the
   // standard offsets scheduler discover their bounds on device.
-  op.active_group_count =
-      compact_grouped_rows && !dynamic_expert_rows
-          ? -static_cast<int>(num_experts)
-          : 0;
+  op.active_group_count = compact_grouped_rows && !dynamic_expert_rows
+                              ? -static_cast<int>(num_experts)
+                              : 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -7607,8 +7601,8 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       input.size(0) == 48 && num_experts == 48 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
   const bool grouped_verifier_shape =
-      input.size(0) == num_experts && num_experts >= 12 &&
-      num_experts <= 48 && num_experts % 6 == 0 &&
+      input.size(0) == num_experts && num_experts >= 12 && num_experts <= 48 &&
+      num_experts % 6 == 0 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
   if ((vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) ||
       (vllm::awq_sm70::mxfp4_moe_grouped_verifier_enabled() &&
