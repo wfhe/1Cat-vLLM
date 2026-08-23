@@ -670,11 +670,19 @@ def benchmark_verifier_m8_pipeline(
     dense = make_buffers()
     active = make_buffers()
     grouped = make_buffers()
+    expert_grouped = make_buffers()
 
     def pipeline_call(
-        buffers: dict[str, torch.Tensor], *, active_only: bool, grouped_m8: bool
+        buffers: dict[str, torch.Tensor],
+        *,
+        active_only: bool,
+        grouped_m8: bool,
+        expert_rows: bool = False,
     ) -> None:
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8"] = "1" if grouped_m8 else "0"
+        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS"] = (
+            "1" if expert_rows else "0"
+        )
         buffers["output"].zero_()
         buffers["topk_ids_i32"].copy_(topk_ids)
         buffers["permuted_idx"].fill_(total_slots)
@@ -699,7 +707,15 @@ def benchmark_verifier_m8_pipeline(
         if active_only:
             stage_offsets = buffers["compact_offsets"]
             if grouped_m8:
-                stage_expert_ids = buffers["permuted_experts_id"]
+                if expert_rows:
+                    _compact_mxfp4_active_experts(
+                        buffers["permuted_experts_id"],
+                        buffers["compact_offsets"],
+                        buffers["active_expert_ids"],
+                    )
+                    stage_expert_ids = buffers["active_expert_ids"]
+                else:
+                    stage_expert_ids = buffers["permuted_experts_id"]
             else:
                 _compact_mxfp4_active_experts(
                     buffers["permuted_experts_id"],
@@ -757,12 +773,24 @@ def benchmark_verifier_m8_pipeline(
     def grouped_call() -> None:
         pipeline_call(grouped, active_only=True, grouped_m8=True)
 
+    def expert_grouped_call() -> None:
+        pipeline_call(
+            expert_grouped,
+            active_only=True,
+            grouped_m8=True,
+            expert_rows=True,
+        )
+
     dense_call()
     active_call()
     grouped_call()
+    expert_grouped_call()
     torch.accelerator.synchronize()
     initial_equal = torch.equal(dense["output"], active["output"])
     grouped_initial_equal = torch.equal(dense["output"], grouped["output"])
+    expert_grouped_initial_equal = torch.equal(
+        dense["output"], expert_grouped["output"]
+    )
     stage_parity = {
         name: torch.equal(dense[name], active[name])
         for name in ("gate_up", "intermediate", "sorted_output", "output")
@@ -771,12 +799,24 @@ def benchmark_verifier_m8_pipeline(
         name: torch.equal(dense[name], grouped[name])
         for name in ("gate_up", "intermediate", "sorted_output", "output")
     }
+    expert_grouped_stage_parity = {
+        name: torch.equal(dense[name], expert_grouped[name])
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    }
     grouped_stage_max_abs = {
         name: float((dense[name] - grouped[name]).abs().max().item())
         for name in ("gate_up", "intermediate", "sorted_output", "output")
     }
+    expert_grouped_stage_max_abs = {
+        name: float((dense[name] - expert_grouped[name]).abs().max().item())
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    }
     grouped_stages_finite = all(
         bool(torch.isfinite(grouped[name]).all().item())
+        for name in ("gate_up", "intermediate", "sorted_output", "output")
+    )
+    expert_grouped_stages_finite = all(
+        bool(torch.isfinite(expert_grouped[name]).all().item())
         for name in ("gate_up", "intermediate", "sorted_output", "output")
     )
     expected_active_ids = sorted({expert for row in route_a for expert in row})
@@ -786,14 +826,17 @@ def benchmark_verifier_m8_pipeline(
     dense_graph = _capture(dense_call)
     active_graph = _capture(active_call)
     grouped_graph = _capture(grouped_call)
+    expert_grouped_graph = _capture(expert_grouped_call)
     dense_ms = _time_graph(dense_graph, repeats)
     active_ms = _time_graph(active_graph, repeats)
     grouped_ms = _time_graph(grouped_graph, repeats)
+    expert_grouped_ms = _time_graph(expert_grouped_graph, repeats)
 
     topk_ids.copy_(torch.tensor(route_b, dtype=torch.int32, device=device))
     dense_graph.replay()
     active_graph.replay()
     grouped_graph.replay()
+    expert_grouped_graph.replay()
     torch.accelerator.synchronize()
     replay_equal = torch.equal(dense["output"], active["output"])
     replay_max_abs = float((dense["output"] - active["output"]).abs().max().item())
@@ -801,12 +844,21 @@ def benchmark_verifier_m8_pipeline(
     grouped_replay_max_abs = float(
         (dense["output"] - grouped["output"]).abs().max().item()
     )
+    expert_grouped_replay_equal = torch.equal(dense["output"], expert_grouped["output"])
+    expert_grouped_replay_max_abs = float(
+        (dense["output"] - expert_grouped["output"]).abs().max().item()
+    )
     route_b_output = grouped["output"].clone()
+    expert_grouped_route_b_output = expert_grouped["output"].clone()
 
     topk_ids.copy_(torch.tensor(route_a, dtype=torch.int32, device=device))
     grouped_graph.replay()
+    expert_grouped_graph.replay()
     torch.accelerator.synchronize()
     route_changes_output = not torch.equal(grouped["output"], route_b_output)
+    expert_grouped_route_changes_output = not torch.equal(
+        expert_grouped["output"], expert_grouped_route_b_output
+    )
 
     result = {
         "route_case": route_case,
@@ -819,22 +871,37 @@ def benchmark_verifier_m8_pipeline(
         "dense_graph_ms": dense_ms,
         "active_graph_ms": active_ms,
         "grouped_graph_ms": grouped_ms,
+        "expert_grouped_graph_ms": expert_grouped_ms,
         "speedup": dense_ms / active_ms,
         "grouped_vs_active_speedup": active_ms / grouped_ms,
+        "expert_grouped_vs_slot_grouped_speedup": grouped_ms / expert_grouped_ms,
+        "expert_grouped_projected_savings_ms_per_43_layers": (
+            grouped_ms - expert_grouped_ms
+        )
+        * 43,
         "grouped_projected_savings_ms_per_43_layers": (active_ms - grouped_ms) * 43,
         "projected_savings_ms_per_43_layers": (dense_ms - active_ms) * 43,
         "initial_bitwise_equal": initial_equal,
         "grouped_initial_bitwise_equal": grouped_initial_equal,
+        "expert_grouped_initial_bitwise_equal": expert_grouped_initial_equal,
         "initial_stage_bitwise_equal": stage_parity,
         "grouped_initial_stage_bitwise_equal": grouped_stage_parity,
+        "expert_grouped_initial_stage_bitwise_equal": expert_grouped_stage_parity,
         "grouped_initial_stage_max_abs": grouped_stage_max_abs,
+        "expert_grouped_initial_stage_max_abs": expert_grouped_stage_max_abs,
         "grouped_stages_finite": grouped_stages_finite,
+        "expert_grouped_stages_finite": expert_grouped_stages_finite,
         "compact_ids_match": compact_ids_match,
         "dynamic_replay_bitwise_equal": replay_equal,
         "dynamic_replay_max_abs": replay_max_abs,
         "grouped_dynamic_replay_bitwise_equal": grouped_replay_equal,
         "grouped_dynamic_replay_max_abs": grouped_replay_max_abs,
+        "expert_grouped_dynamic_replay_bitwise_equal": expert_grouped_replay_equal,
+        "expert_grouped_dynamic_replay_max_abs": expert_grouped_replay_max_abs,
         "dynamic_route_changes_output": route_changes_output,
+        "expert_grouped_dynamic_route_changes_output": (
+            expert_grouped_route_changes_output
+        ),
     }
     base_gate_passed = (
         initial_equal
@@ -843,6 +910,8 @@ def benchmark_verifier_m8_pipeline(
         and replay_equal
         and route_changes_output
         and grouped_stages_finite
+        and expert_grouped_stages_finite
+        and expert_grouped_route_changes_output
     )
     grouped_bitwise_gate_passed = (
         grouped_initial_equal
@@ -1002,7 +1071,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--route-case",
-        choices=("mixed", "unique48", "hot6"),
+        choices=("mixed", "unique48", "hot6", "all"),
         default="mixed",
         help="Verifier M8 expert-overlap distribution.",
     )
@@ -1023,15 +1092,23 @@ def main() -> int:
     args = parse_args()
     _require_sm70()
     if args.verifier_m8_pipeline:
-        result = benchmark_verifier_m8_pipeline(
-            num_experts=args.num_experts,
-            top_k=args.top_k,
-            repeats=args.repeats,
-            seed=args.seed,
-            route_case=args.route_case,
-            input_scale=args.input_scale,
-            require_grouped_bitwise=not args.allow_grouped_numeric_drift,
+        route_cases = (
+            ("mixed", "unique48", "hot6")
+            if args.route_case == "all"
+            else (args.route_case,)
         )
+        result = {
+            route_case: benchmark_verifier_m8_pipeline(
+                num_experts=args.num_experts,
+                top_k=args.top_k,
+                repeats=args.repeats,
+                seed=args.seed + index,
+                route_case=route_case,
+                input_scale=args.input_scale,
+                require_grouped_bitwise=not args.allow_grouped_numeric_drift,
+            )
+            for index, route_case in enumerate(route_cases)
+        }
         print(
             json.dumps(
                 {

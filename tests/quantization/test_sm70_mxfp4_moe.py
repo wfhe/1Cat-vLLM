@@ -308,6 +308,9 @@ def test_mxfp4_sm70_m8_grouped_dispatch_keeps_one_row_slots(monkeypatch):
     }
     monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
     monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: False
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -318,6 +321,33 @@ def test_mxfp4_sm70_m8_grouped_dispatch_keeps_one_row_slots(monkeypatch):
 
     assert offsets is buffers["slot_expert_offsets"]
     assert expert_ids is buffers["permuted_experts_id"]
+    assert count == 48
+
+
+def test_mxfp4_sm70_m8_expert_grouped_dispatch_keeps_real_segments(monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(49, dtype=torch.int32) * 2,
+        "slot_expert_offsets": torch.arange(49, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(48, dtype=torch.int32).flip(0),
+        "active_expert_ids": torch.arange(48, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: True
+    )
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=8,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    assert offsets is buffers["compact_expert_offsets"]
+    assert expert_ids is buffers["active_expert_ids"]
     assert count == 48
 
 
