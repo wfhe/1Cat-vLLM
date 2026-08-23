@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1769,6 +1770,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # can be paired against the unchanged verifier in isolation.
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
+    ),
+    # Route the Qwen3.8 target GDN output gate through the existing one-pass
+    # CUDA RMSNormGated implementation. Keep this DFlash2/SM70-only and
+    # default-off until paired target-graph and quality gates pass.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
