@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = True
     VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = True
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
+    VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1797,6 +1798,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
+    ),
+    # Avoid materializing/gathering full-vocabulary target logits when the
+    # DFlash2 proposal and target sampling distributions both have compact
+    # top-k support. Default-off until paired output/acceptance and end-to-end
+    # V100 gates pass; unsupported sampling features fall back to dense logits.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,

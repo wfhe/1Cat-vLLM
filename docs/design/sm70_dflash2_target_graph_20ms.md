@@ -241,3 +241,90 @@ LM-head top-20 epilogue, but the `_C` binary linked into this worktree predates
 that op. The first TP4 microbenchmark was therefore rejected at route checking
 without recording a timing; an incremental SM70 build is required before this
 candidate can pass the microbenchmark gate.
+
+### Compact target sampling microbenchmarks and gated integration
+
+The production-shaped TP4 communication probe uses eight verifier rows,
+vocabulary 248,320, target top-K 20, and four V100s. It compares the existing
+full-vocabulary all-gather plus global top-K with local top-K followed by two
+compact all-gathers and a global merge:
+
+- Exact top-K token IDs and values match.
+- The full path moves 993,280 bytes per rank; the two-gather compact path moves
+  1,920 bytes, a 517x reduction.
+- Despite that byte reduction, p50 is 0.3318 ms for full gather plus top-K and
+  0.3292 ms for the compact path. Local top-K (0.1208 ms), two collectives
+  (0.0911 ms), and compact merge (0.0896 ms) consume the saved transport time.
+- Packing values and IDs into one collective is slower at 0.3538 ms.
+
+Compact communication alone is therefore rejected as a performance feature.
+The retained artifact is
+`results/tp4-compact-verifier-logits-m8-v248320-k20.json`.
+
+The second probe fuses compact target top-p, DFlash2 acceptance, log-domain
+`relu(p-q)` recovery, and token-keyed Gumbel resampling into one Triton program
+per request. At the real B1/block-eight shape it is token/count exact against
+the dense rejection path for block 4/8 and `top_p` 1.0/0.95. Its p50 is:
+
+| Isolated stage | p50 |
+| --- | ---: |
+| Dense top-K/top-p | 0.8366 ms |
+| Dense rejection only | 0.2202 ms |
+| Dense top-K/top-p plus rejection | 0.8663 ms |
+| Compact top-p plus sparse rejection | **0.0901 ms** |
+
+Combining this result with the measured TP4 compact-candidate transport gives
+an expected real saving of roughly 0.5-0.6 ms per complete round. The artifact
+is `results/dflash2-sparse-rejection-b8-v248320-k20-q16-v1.json`.
+
+The candidate is integrated behind default-off
+`VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION=1`. Its route is limited to SM70,
+MRV2 DFlash2, one active decode request, probabilistic proposals, target
+`top_k=20`, positive temperature, `0 < top_p <= 1`, and no grammar, min-p,
+penalty, logit bias, bad words, NaN reporting, or logprob request. Every other
+configuration computes the unchanged dense logits and uses the shared
+rejection sampler. DFlash2 now keeps the 16 proposal IDs and FP32 realized
+scores in persistent request-slot order in addition to the dense fallback
+cache; a V100 poisoned/reordered-slot test verifies the mapping.
+
+Validation completed before the full-model run:
+
+- DFlash2 CPU suite: 46 passed, 11 CUDA-only skipped.
+- Strict route and fallback tests: 13 passed.
+- Sparse dense-equivalence plus selector/cache CUDA tests: 6 passed.
+- Ruff, formatting, compileall, and `git diff --check`: passed.
+
+The matched single-request Graph/Nsight run remains pending because both TP4
+GPU groups became occupied by unrelated work after these tests. No external
+process was interrupted.
+
+### Residual target-graph service after the 27.951 ms round
+
+The accepted 1,257-node target graph has 18.357 ms of rank-0 GPU service inside
+its 19.261 ms critical span. Its largest exact buckets per replay are:
+
+| Target graph bucket | Nodes | GPU service |
+| --- | ---: | ---: |
+| TurboMind FP8 GEMM | 256 | 10.730 ms |
+| vLLM one-stage TP4 all-reduce | 128 | 2.313 ms |
+| recurrent GDN verifier | 48 | 1.213 ms |
+| Flash-V100 partition/reduce | 32 | 0.802 ms |
+| fused Gemma residual/RMS suffix | 127 | 0.643 ms |
+| generic elementwise | 144 | 0.541 ms |
+
+The FP8 GEMMs split into three stable launch shapes: 64 calls at 4.394 ms,
+128 calls at 3.924 ms, and 64 calls at 2.411 ms. They already match the retained
+SGLang target GEMM total closely, so replacing them is a separate QPN8 quality
+and throughput project rather than the next low-risk leaf.
+
+The TP4 collective remains the clearest next `>1 ms` gap. vLLM launches ten
+512-thread CTAs and averages 18.07 microseconds per call. The matched
+SGLang-V100 trace uses its JIT one-shot push kernel with eighty 128-thread CTAs
+and averages 12.36 microseconds. Across 128 calls this structural difference is
+about 0.73 ms of service; the broader matched audit found a 0.7-1.2 ms
+per-graph TP reduction gap depending on critical-rank accounting. The next
+microbenchmark should compare the exact `[8,5120]` FP16 target shape under one
+captured 128-call chain, first sweeping the existing vLLM CTA/thread policy,
+then porting SGLang's two-epoch push buffer only if the policy sweep cannot
+close the gap. Bitwise FP32 accumulation order, CUDA-Graph registration, and
+all 128 collective dependencies are hard gates.
