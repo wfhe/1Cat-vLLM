@@ -27,6 +27,10 @@ class DSparkProposer(DFlashProposer):
             torch.arange(self.max_batch_size, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
+        self._last_confidence_logits: torch.Tensor | None = None
+
+    def take_last_confidence_logits(self) -> torch.Tensor | None:
+        return self._last_confidence_logits
 
     @override
     def _sample_draft_tokens(
@@ -54,9 +58,11 @@ class DSparkProposer(DFlashProposer):
         # contents across asynchronous scheduling and CUDA Graph replay.
         prev = self.input_ids[self._anchor_indices[:batch_size]].to(torch.long)
         draft_tokens: list[torch.Tensor] = []
+        markov_embeds: list[torch.Tensor] = []
         draft_probs: list[torch.Tensor] | None = None
         for step in range(self.num_speculative_tokens):
             markov_embed = self.model.markov_embed(prev)
+            markov_embeds.append(markov_embed)
             step_logits = base_logits[:, step] + self.model.markov_bias(markov_embed)
             sampled, step_probs = self._sample_from_logits(
                 step_logits,
@@ -69,6 +75,13 @@ class DSparkProposer(DFlashProposer):
                     draft_probs = []
                 draft_probs.append(step_probs)
 
+        block_hidden_states = hidden_states.view(
+            batch_size, self.num_speculative_tokens, -1
+        )
+        self._last_confidence_logits = self.model.confidence_logits(
+            block_hidden_states,
+            torch.stack(markov_embeds, dim=1),
+        )
         flat_tokens = torch.stack(draft_tokens, dim=1).reshape(-1)
         if draft_probs is None:
             return flat_tokens, None

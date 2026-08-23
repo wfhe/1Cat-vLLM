@@ -204,6 +204,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.draft_prob_alignment import (
     clone_draft_prob_token_ids,
     get_aligned_draft_probs,
+    get_aligned_draft_scalar_values,
 )
 from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -1780,6 +1781,9 @@ class GPUModelRunner(
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
         self._draft_prob_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_confidence_logits: torch.Tensor | None = None
+        self._draft_confidence_req_ids: list[str] | None = None
+        self._draft_confidence_token_ids: list[list[int]] | torch.Tensor | None = None
         self._dflash_ddtree_payloads: tuple[DDTreeDraftPayload, ...] | None = None
         self._ddtree_parent_metadata: DDTreeParentMetadata | None = None
         self._ddtree_accepted_rows_cpu_sidecar: list[list[int]] | None = None
@@ -7377,6 +7381,9 @@ class GPUModelRunner(
             )
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        draft_confidence_logits = self._get_spec_decode_confidence_logits(
+            spec_decode_metadata
+        )
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
@@ -7396,6 +7403,7 @@ class GPUModelRunner(
             draft_probs,
             logits,
             sampling_metadata,
+            draft_confidence_logits=draft_confidence_logits,
         )
         target_candidate_ids = self.rejection_sampler.take_last_target_candidate_ids()
         if target_candidate_ids is not None and hasattr(
@@ -8849,6 +8857,9 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_prob_token_ids = None
+        self._draft_confidence_logits = None
+        self._draft_confidence_req_ids = None
+        self._draft_confidence_token_ids = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
         self._ddtree_accepted_rows_cpu_sidecar = None
@@ -8992,6 +9003,9 @@ class GPUModelRunner(
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
                 self._draft_prob_token_ids = None
+                self._draft_confidence_logits = None
+                self._draft_confidence_req_ids = None
+                self._draft_confidence_token_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
@@ -9366,6 +9380,22 @@ class GPUModelRunner(
             spec_decode_metadata=spec_decode_metadata,
         )
 
+    def _get_spec_decode_confidence_logits(
+        self, spec_decode_metadata: SpecDecodeMetadata
+    ) -> torch.Tensor | None:
+        # Alignment has a small but non-zero launch/copy cost. Keep it out of
+        # ordinary serving until confidence scheduling is explicitly enabled;
+        # alignment dumps are the calibration path used before that gate.
+        if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+            return None
+        return get_aligned_draft_scalar_values(
+            req_ids=self.input_batch.req_ids,
+            values=self._draft_confidence_logits,
+            value_req_ids=self._draft_confidence_req_ids,
+            value_token_ids=self._draft_confidence_token_ids,
+            spec_decode_metadata=spec_decode_metadata,
+        )
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -9384,6 +9414,9 @@ class GPUModelRunner(
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_prob_token_ids = None
+        self._draft_confidence_logits = None
+        self._draft_confidence_req_ids = None
+        self._draft_confidence_token_ids = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
         self._ddtree_accepted_rows_cpu_sidecar = None
@@ -9698,6 +9731,14 @@ class GPUModelRunner(
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
                     self._draft_prob_token_ids = clone_draft_prob_token_ids(
+                        draft_token_ids
+                    )
+            if hasattr(self.drafter, "take_last_confidence_logits"):
+                confidence_logits = self.drafter.take_last_confidence_logits()
+                if confidence_logits is not None:
+                    self._draft_confidence_logits = confidence_logits
+                    self._draft_confidence_req_ids = self.input_batch.req_ids.copy()
+                    self._draft_confidence_token_ids = clone_draft_prob_token_ids(
                         draft_token_ids
                     )
             if hasattr(self.drafter, "take_last_ddtree_payloads"):

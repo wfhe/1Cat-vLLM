@@ -270,6 +270,7 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        draft_confidence_logits: torch.Tensor | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -331,6 +332,7 @@ class RejectionSampler(nn.Module):
                 bonus_logits_indices=bonus_logits_indices,
                 profile_events=profile_events,
                 profile_total_start=profile_total_start,
+                draft_confidence_logits=draft_confidence_logits,
             )
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
@@ -426,6 +428,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids=bonus_token_ids,
             output_token_ids=output_token_ids,
             sampling_metadata=sampling_metadata,
+            draft_confidence_logits=draft_confidence_logits,
         )
 
         logprobs_tensors = None
@@ -455,6 +458,7 @@ class RejectionSampler(nn.Module):
         bonus_logits_indices: torch.Tensor,
         profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
         profile_total_start: torch.cuda.Event | None,
+        draft_confidence_logits: torch.Tensor | None,
     ) -> SamplerOutput:
         profile_constraints_start = _rejection_profile_start(profile_events)
         sampled_logits = logits.to(torch.float32)
@@ -510,6 +514,7 @@ class RejectionSampler(nn.Module):
             bonus_token_ids=bonus_token_ids,
             output_token_ids=output_token_ids,
             sampling_metadata=sampling_metadata,
+            draft_confidence_logits=draft_confidence_logits,
         )
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
@@ -574,6 +579,7 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         output_token_ids: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        draft_confidence_logits: torch.Tensor | None,
     ) -> None:
         global _SPEC_ALIGNMENT_DUMP_COUNT, _SPEC_ALIGNMENT_STEP_COUNTER
         _SPEC_ALIGNMENT_STEP_COUNTER += 1
@@ -672,9 +678,23 @@ class RejectionSampler(nn.Module):
                     .cpu()
                 )
                 payload["recovered_residual_mass"] = residual_mass.detach().cpu()
+                payload["conditional_acceptance_targets"] = (
+                    torch.minimum(target_probs, draft_probs).sum(dim=-1).detach().cpu()
+                )
                 draft_topk = torch.topk(draft_probs, k=k, dim=-1)
                 payload["draft_topk_ids"] = draft_topk.indices.detach().cpu()
                 payload["draft_topk_values"] = draft_topk.values.detach().cpu()
+            if draft_confidence_logits is not None:
+                if draft_confidence_logits.shape != (target_logits.shape[0],):
+                    raise RuntimeError(
+                        "Aligned DSpark confidence logits must have one value per "
+                        "draft token: "
+                        f"confidence={tuple(draft_confidence_logits.shape)}, "
+                        f"target={target_logits.shape[0]}."
+                    )
+                payload["draft_confidence_logits"] = (
+                    draft_confidence_logits.detach().float().cpu()
+                )
             _SPEC_ALIGNMENT_DUMP_COUNT += 1
             dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
             os.makedirs(dump_dir, exist_ok=True)

@@ -27,7 +27,9 @@ def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
     assert remap("mtp.2.markov_head.markov_w1.weight") == (
         "model.markov_head.markov_w1.weight"
     )
-    assert remap("mtp.2.confidence_head.proj.weight") is None
+    assert remap("mtp.2.confidence_head.proj.weight") == (
+        "model.confidence_head.proj.weight"
+    )
 
 
 class _FakeDSparkModel:
@@ -46,6 +48,13 @@ class _FakeDSparkModel:
         bias = torch.zeros(previous.shape[0], self.vocab_size)
         bias.scatter_(1, ((previous + 1) % self.vocab_size).unsqueeze(1), 10.0)
         return bias
+
+    @staticmethod
+    def confidence_logits(
+        hidden_states: torch.Tensor,
+        markov_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states.sum(dim=-1) + markov_embeds.sum(dim=-1)
 
     @staticmethod
     def map_draft_to_target(token_ids: torch.Tensor) -> torch.Tensor:
@@ -83,6 +92,7 @@ def test_dspark_markov_sampling_is_sequential(
         for anchor in (1, 4)
     ]
     assert output.view(2, num_speculative_tokens).tolist() == expected
+    assert proposer._last_confidence_logits.shape == (2, num_speculative_tokens)
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [5, 7])
@@ -132,6 +142,7 @@ def test_dspark_probabilistic_sampling_returns_sequential_probs(
         for anchor in (1, 4)
     ]
     assert output.view(2, num_speculative_tokens).tolist() == expected
+    assert proposer._last_confidence_logits.shape == (2, num_speculative_tokens)
 
 
 def test_dspark_replicated_linears_return_tensors() -> None:

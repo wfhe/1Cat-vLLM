@@ -71,6 +71,32 @@ class DSparkMarkovHead(nn.Module):
         return self.markov_w2(markov_embed)
 
 
+class DSparkConfidenceHead(nn.Module):
+    """Replicated FP32 conditional-acceptance predictor."""
+
+    def __init__(self, input_size: int, prefix: str) -> None:
+        super().__init__()
+        # The checkpoint tensor is BF16, but the official implementation keeps
+        # this projection and its input in FP32 for calibration accuracy.
+        self.proj = ReplicatedLinear(
+            input_size,
+            1,
+            bias=False,
+            params_dtype=torch.float32,
+            quant_config=None,
+            return_bias=False,
+            prefix=maybe_prefix(prefix, "proj"),
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        markov_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        features = torch.cat((hidden_states.float(), markov_embeds.float()), dim=-1)
+        return self.proj(features).squeeze(-1)
+
+
 class DSparkDeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -146,6 +172,10 @@ class DSparkDeepseekV4Model(nn.Module):
             config.vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+        )
+        self.confidence_head = DSparkConfidenceHead(
+            config.hidden_size + config.dspark_markov_rank,
+            prefix=maybe_prefix(prefix, "confidence_head"),
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -311,6 +341,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed)
 
+    def confidence_logits(
+        self,
+        hidden_states: torch.Tensor,
+        markov_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.confidence_head(hidden_states, markov_embeds)
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 
@@ -426,14 +463,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(match.group(1))
         rest = match.group(2)
-        if rest.startswith("confidence_head."):
-            return None
         head_prefixes = (
             "norm.",
             "hc_head_fn",
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
+            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes
