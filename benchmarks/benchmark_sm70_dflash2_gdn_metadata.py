@@ -299,9 +299,7 @@ def _run_case(
 
     legacy_launches = _profile_cuda_launches(legacy_step)
     fused_launches = _profile_cuda_launches(fused_step)
-    fused_with_host_fence_launches = _profile_cuda_launches(
-        fused_with_host_fence_step
-    )
+    fused_with_host_fence_launches = _profile_cuda_launches(fused_with_host_fence_step)
     fused_kernel_only_launches = _profile_cuda_launches(fused_kernel_only_step)
     legacy = _measure(legacy_step, repeats)
     fused = _measure(fused_step, repeats)

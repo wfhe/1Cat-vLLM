@@ -1754,8 +1754,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
-                    common_gdn_metadata.num_spec_decode_tokens
-                    == num_spec_decode_tokens
+                    common_gdn_metadata.num_spec_decode_tokens == num_spec_decode_tokens
                 )
             assert spec_state_indices_tensor is not None
             assert spec_state_indices_tensor.shape[0] == num_spec_decodes

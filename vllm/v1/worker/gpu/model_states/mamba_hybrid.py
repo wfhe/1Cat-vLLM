@@ -121,9 +121,7 @@ class MambaHybridModelState(DefaultModelState):
             and "DFlash2DraftModel" in draft_architectures
         )
         if self._use_dflash2_common_gdn_metadata:
-            logger.info_once(
-                "DFlash2 shared GDN batch metadata fast path enabled."
-            )
+            logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
         self._use_dflash2_fused_gdn_metadata = bool(
             self._use_dflash2_common_gdn_metadata
             and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
