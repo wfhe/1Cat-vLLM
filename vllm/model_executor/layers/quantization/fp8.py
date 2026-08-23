@@ -175,12 +175,24 @@ def _is_qwen38_27b_fp8_qpn8_model() -> bool:
 
 
 def _is_sm70_fp8_qpn8_runtime_contract() -> bool:
-    """Admit only the no-MTP M range with a measured native decode kernel."""
+    """Admit the measured M range for target-only or MRV2 DFlash2."""
     vllm_config = get_current_vllm_config()
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 1))
     speculative_config = getattr(vllm_config, "speculative_config", None)
-    return max_num_seqs <= _SM70_FP8_QPN8_MAX_NUM_SEQS and speculative_config is None
+    if max_num_seqs > _SM70_FP8_QPN8_MAX_NUM_SEQS:
+        return False
+    if speculative_config is None:
+        return True
+
+    use_dflash = getattr(speculative_config, "use_dflash", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    draft_architectures = getattr(draft_model_config, "architectures", None) or ()
+    return bool(
+        callable(use_dflash)
+        and use_dflash()
+        and "DFlash2DraftModel" in draft_architectures
+    )
 
 
 def _missing_sm70_fp8_qpn8_ops() -> list[str]:
@@ -675,9 +687,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if qpn8_model_layer and not qpn8_concurrency:
                 logger.info_once(
-                    "The SM70 FP8 QPN8 route retains TurboMind when MTP is "
-                    "enabled or max_num_seqs exceeds 8; the accepted native "
-                    "QPN8 contract is no-MTP with M<=8."
+                    "The SM70 FP8 QPN8 route retains TurboMind for speculative "
+                    "methods other than MRV2 DFlash2, for DFlash1, or when "
+                    "max_num_seqs exceeds 8."
                 )
             if qpn8_model_layer and qpn8_concurrency:
                 missing_ops = _missing_sm70_fp8_qpn8_ops()

@@ -116,6 +116,20 @@ def test_fp8_qpn8_model_gate_is_qwen38_27b_specific(monkeypatch):
     vllm_config.scheduler_config.max_num_seqs = 16
     assert not _is_sm70_fp8_qpn8_runtime_contract()
     vllm_config.scheduler_config.max_num_seqs = 8
+    vllm_config.speculative_config = SimpleNamespace(
+        use_dflash=lambda: True,
+        draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+    )
+    assert _is_sm70_fp8_qpn8_runtime_contract()
+    vllm_config.speculative_config.draft_model_config.architectures = [
+        "DFlashDraftModel"
+    ]
+    assert not _is_sm70_fp8_qpn8_runtime_contract()
+    vllm_config.speculative_config = SimpleNamespace(
+        use_dflash=lambda: False,
+        draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
+    )
+    assert not _is_sm70_fp8_qpn8_runtime_contract()
     vllm_config.speculative_config = object()
     assert not _is_sm70_fp8_qpn8_runtime_contract()
     text_config.hidden_size = 4096

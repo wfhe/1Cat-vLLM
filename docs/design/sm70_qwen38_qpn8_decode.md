@@ -5,8 +5,10 @@ Date: 2026-08-23
 ## Decision
 
 The memory-neutral QPN8 dense route is default-on for the accepted
-Qwen3.8-27B-FP8 TP4 no-MTP model and projection shapes when configured
-`max_num_seqs` is at most eight. Set
+Qwen3.8-27B-FP8 TP4 target-only model and projection shapes when configured
+`max_num_seqs` is at most eight. The DFlash2 migration also admits the same
+target backbone only for `method=dflash` with the `DFlash2DraftModel`
+architecture. DFlash1, DDTree, Eagle, and MTP retain TurboMind. Set
 `VLLM_SM70_FP8_QPN8=0` to retain the prior TurboMind layout. An automatic
 route using an older `vllm._C` warns and falls back; an explicit request with
 missing QPN8 operators fails closed.
