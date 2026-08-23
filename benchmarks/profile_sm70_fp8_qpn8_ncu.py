@@ -48,7 +48,7 @@ def _parse_args() -> argparse.Namespace:
 def _time(launch: Any, warmup: int, repeats: int) -> float:
     for _ in range(warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -63,7 +63,7 @@ def main() -> int:
     args = _parse_args()
     torch.ops.load_library(str(args.qpn8_library.resolve()))
     device = torch.device(args.device)
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device.index or 0)
     if torch.cuda.get_device_capability(device) != (7, 0):
         raise RuntimeError("This profiler requires SM70/V100")
     if args.m < 1 or args.m > 8:
@@ -165,7 +165,7 @@ def main() -> int:
         torch.cuda.nvtx.range_push(f"qpn8_{item['case']}")
         item["launch_qpn"]()
         torch.cuda.nvtx.range_pop()
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
     torch.cuda.nvtx.range_pop()
     torch.cuda.cudart().cudaProfilerStop()
 

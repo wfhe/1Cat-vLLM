@@ -237,6 +237,29 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool gated_silu) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
+  ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
+  ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
+
+  ops.def(
+      "fp8_qpn8_dequantize_sm70_out(Tensor(a!) out, Tensor codes, "
+      "Tensor group_scales) -> ()");
+  ops.impl("fp8_qpn8_dequantize_sm70_out", torch::kCUDA,
+           &fp8_qpn8_dequantize_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_prefill_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor group_scales, bool gated_silu) -> "
+      "()");
+  ops.impl("fp8_qpn8_prefill_sm70_out", torch::kCUDA,
+           &fp8_qpn8_prefill_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_dispatch_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor group_scales, int split_k, "
+      "int accumulator_chains, bool prefetch_codes, bool gated_silu) -> ()");
+  ops.impl("fp8_qpn8_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_dispatch_sm70_out);
+
   ops.def(
       "fp8_qpn8_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor group_scales, int split_k, int accumulator_chains, "
