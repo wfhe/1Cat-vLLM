@@ -41803,5 +41803,25 @@ Interpretation:
   was `154.865/147.180/163.480 tok/s`; endpoint mean is `+8.15%`. Summed pure
   decode improves `+4.47%`, P50 TPOT is effectively flat (`+0.14%`), and mean
   acceptance is lower than control rather than artificially favorable. M17+
-  retains the old prefill tile. The final six-point GPU0-3 curve and
-  GSM8K/ShareGPT quality remain required.
+  retains the old prefill tile.
+- Every C1 graph all-reduce in the Nsight trace is the exact 10,240-element
+  FP16 verifier payload. A TP4 operator sweep found that one CTA is faster for
+  this 20-KiB payload, while eight CTAs are faster only for the exact
+  C8/C12/C16 verifier payloads; C2/C4 retain the default. A physical-GPU4-7 C1
+  candidate/control/candidate sandwich with the one-CTA launch measured
+  endpoint-mean pure decode `116.405` versus `112.842 tok/s` (`+3.16%`), output
+  `103.070` versus `100.112 tok/s` (`+2.96%`), and P50 TPOT `8.678` versus
+  `8.750 ms` (`-0.82%`). The source heuristic is limited to fully connected
+  SM70 TP4, the exact MTP4 payloads, and ordinary all-reduce; the global block
+  override still takes precedence and
+  `VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING=0` restores the legacy policy.
+- The C1 graph also spends about `0.509 ms` per cycle in the combined
+  top-k/top-p kernel over five 248,320-vocabulary verifier rows. Keeping the
+  existing 8192/4096 tiles and masking algorithm but launching eight rather
+  than four warps improves isolated B5/B10/B20/B40/B60/B80 means by
+  `1.737x/1.943x/1.881x/1.732x/1.689x/1.646x`. Every candidate had zero finite
+  mask or retained-value mismatches against the four-warp result. The default
+  source change is therefore restricted to combined top-k plus top-p on SM70
+  with Qwen3.6's exact vocabulary; setting
+  `VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS=0` restores Triton's default launch.
+- The final six-point GPU0-3 curve and GSM8K/ShareGPT quality remain required.

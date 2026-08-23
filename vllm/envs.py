@@ -179,12 +179,14 @@ if TYPE_CHECKING:
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
+    VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS: bool = True
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
+    VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = True
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
     VLLM_SM70_F16_DENSE_ALLOWLIST: str | None = None
     VLLM_SM70_MOE_DENSE_ALLOWLIST: str | None = None
@@ -1760,6 +1762,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE": lambda: bool(
         int(os.getenv("VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE", "0"))
     ),
+    # Use the V100-tuned launch for Qwen3.6's 248320-vocabulary combined
+    # top-k/top-p kernel. Set to 0 to preserve Triton's four-warp default.
+    "VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS", "1"))
+    ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
     # decode steps before collecting CPU-visible outputs; this changes queueing
@@ -1786,6 +1793,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ["VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT"])
         if "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT" in os.environ
         else None
+    ),
+    # Tune only the exact Qwen3.6 MTP4 verifier all-reduce payloads on
+    # fully-connected SM70 TP4. Set to 0 for the legacy 36-CTA launch policy.
+    "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING": lambda: bool(
+        int(os.getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING", "1"))
     ),
     "VLLM_SM70_TP4_M5_AR_THREADS": lambda: (
         int(os.environ["VLLM_SM70_TP4_M5_AR_THREADS"])

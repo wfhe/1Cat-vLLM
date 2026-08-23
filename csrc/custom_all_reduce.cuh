@@ -51,6 +51,7 @@ inline hipPointer_attribute rangeStartAddrAttr =
 
 constexpr size_t kSm70Tp2SmallAllreduceBytes = 40 * 1024;
 constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
+constexpr size_t kSm70Tp4MtpVerifierBytesPerRequest = 5 * 2048 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
@@ -96,14 +97,29 @@ inline bool sm70_tp8_hierarchical_peer(int rank, int peer) {
   return rank / 4 == peer / 4 || rank + 4 == peer || peer + 4 == rank;
 }
 
-inline int custom_allreduce_block_limit(int default_limit,
-                                        int world_size,
-                                        size_t bytes) {
+inline int custom_allreduce_block_limit(int default_limit, int world_size,
+                                        bool fully_connected, size_t bytes,
+                                        bool tune_sm70_tp4_mtp) {
   const char* raw = std::getenv("VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT");
   if (raw == nullptr || raw[0] == '\0') {
     if (world_size == 2 && bytes <= kSm70Tp2SmallAllreduceBytes &&
         custom_allreduce_current_device_is_sm70()) {
       return 1;
+    }
+    const char* tune_raw = std::getenv("VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING");
+    const bool tuning_enabled =
+        tune_raw == nullptr || tune_raw[0] == '\0' || std::atoi(tune_raw) != 0;
+    if (tune_sm70_tp4_mtp && tuning_enabled &&
+        default_limit == defaultBlockLimit && world_size == 4 &&
+        fully_connected && custom_allreduce_current_device_is_sm70()) {
+      if (bytes == kSm70Tp4MtpVerifierBytesPerRequest) {
+        return 1;
+      }
+      if (bytes == 8 * kSm70Tp4MtpVerifierBytesPerRequest ||
+          bytes == 12 * kSm70Tp4MtpVerifierBytesPerRequest ||
+          bytes == 16 * kSm70Tp4MtpVerifierBytesPerRequest) {
+        return 8;
+      }
     }
     return default_limit;
   }
@@ -1077,7 +1093,8 @@ class CustomAllreduce {
   void allreduce(cudaStream_t stream, T* input, T* output, int size,
                  int threads = 512, int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
+        block_limit, world_size_, fully_connected_,
+        static_cast<size_t>(size) * sizeof(T), true);
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(
@@ -1241,7 +1258,8 @@ class CustomAllreduce {
                       int size, int threads = 512,
                       int block_limit = defaultBlockLimit) {
     block_limit = custom_allreduce_block_limit(
-        block_limit, world_size_, static_cast<size_t>(size) * sizeof(T));
+        block_limit, world_size_, fully_connected_,
+        static_cast<size_t>(size) * sizeof(T), false);
     auto d = packed_t<T>::P::size;
     if (size % d != 0)
       throw std::runtime_error(

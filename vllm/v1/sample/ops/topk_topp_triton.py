@@ -11,6 +11,8 @@ using Pivot-based Truncation and Selection" By Park et al.
 
 import torch
 
+from vllm import envs
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
@@ -1044,6 +1046,21 @@ def apply_top_k_top_p_triton(
     else:
         block_size, block_size_trunc = 8192, 4096
 
+    launch_kwargs: dict[str, int] = {}
+    if (
+        envs.VLLM_SM70_QWEN36_TOPK_TOPP_8_WARPS
+        and logits.device.type == "cuda"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+        and vocab_size == 248_320
+        and topk_enabled
+        and topp_enabled
+    ):
+        # Qwen3.6 MTP4 presents five verifier rows per live request. On V100,
+        # eight warps preserve this kernel's tile and masking algorithm while
+        # using the otherwise idle lanes in its reduction-heavy passes.
+        launch_kwargs["num_warps"] = 8
+
     _topk_topp_kernel[(NUM_PROGRAMS,)](
         logits,
         logits.stride(0),
@@ -1059,6 +1076,7 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        **launch_kwargs,
     )
 
     return logits
