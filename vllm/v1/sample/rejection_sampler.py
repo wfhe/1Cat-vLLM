@@ -657,6 +657,9 @@ class RejectionSampler(nn.Module):
                 "sampling_output_token_ids_tail": [
                     list(ids[-32:]) for ids in sampling_metadata.output_token_ids
                 ],
+                "sampling_output_lengths": [
+                    len(ids) for ids in sampling_metadata.output_token_ids
+                ],
                 "sampling_spec_token_ids": [
                     list(ids) for ids in (sampling_metadata.spec_token_ids or [])
                 ],
