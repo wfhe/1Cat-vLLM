@@ -174,7 +174,10 @@ The first paired LongBench subset is `hotpotqa`, `multifieldqa_zh`,
 `gov_report`, and `lcc`. Official LongBench metrics are loaded from the pinned
 local checkout; `jieba==0.42.1`, `rouge==1.0.1`, and `fuzzywuzzy==0.18.0` are
 isolated under `/data/models/dsv4-quality-deps` rather than installed into the
-shared runtime environment.
+shared runtime environment. Every quality artifact includes SHA-256 hashes for
+the HumanEval tasks, LongBench prompt/max-length configs, and each selected
+dataset. LongBench records retain their source-row indices so the matched
+no-speculation and DSpark scores cannot silently use different samples.
 
 ## Rejected or Deferred Paths
 

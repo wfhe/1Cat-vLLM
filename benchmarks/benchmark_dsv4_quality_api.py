@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import functools
+import hashlib
 import http.client
 import json
 import os
@@ -23,6 +24,14 @@ from urllib.parse import urlparse
 from transformers import AutoTokenizer
 
 NO_CHAT_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _post_json(
@@ -403,13 +412,15 @@ def _run_longbench(
 
     by_dataset: dict[str, Any] = {}
     for dataset in datasets:
-        rows = [
-            json.loads(line)
-            for line in (data_dir / f"{dataset}.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
-            if line.strip()
-        ]
+        rows = []
+        for source_index, line in enumerate(
+            (data_dir / f"{dataset}.jsonl").read_text(encoding="utf-8").splitlines()
+        ):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            row["_source_index"] = source_index
+            rows.append(row)
         selected = _select_longbench_rows(rows, limit)
         records: list[dict[str, Any]] = []
         for row in selected:
@@ -445,6 +456,7 @@ def _run_longbench(
             )
             records.append(
                 {
+                    "source_index": row["_source_index"],
                     "length": row.get("length"),
                     "score": score,
                     "prediction": prediction,
@@ -515,6 +527,31 @@ def main() -> int:
         trust_remote_code=True,
     )
 
+    datasets = [
+        value.strip() for value in args.longbench_datasets.split(",") if value.strip()
+    ]
+    input_manifest = {
+        "humaneval_tasks": {
+            "path": str(args.humaneval_tasks),
+            "sha256": _sha256(args.humaneval_tasks),
+        },
+        "longbench_prompt_config": {
+            "path": str(args.longbench_root / "config/dataset2prompt.json"),
+            "sha256": _sha256(args.longbench_root / "config/dataset2prompt.json"),
+        },
+        "longbench_maxlen_config": {
+            "path": str(args.longbench_root / "config/dataset2maxlen.json"),
+            "sha256": _sha256(args.longbench_root / "config/dataset2maxlen.json"),
+        },
+        "longbench_datasets": {
+            dataset: {
+                "path": str(args.longbench_data_dir / f"{dataset}.jsonl"),
+                "sha256": _sha256(args.longbench_data_dir / f"{dataset}.jsonl"),
+            }
+            for dataset in datasets
+        },
+    }
+
     human_eval = _run_humaneval(
         host=host,
         port=port,
@@ -530,11 +567,7 @@ def main() -> int:
         model=args.model,
         data_dir=args.longbench_data_dir,
         longbench_root=args.longbench_root,
-        datasets=[
-            value.strip()
-            for value in args.longbench_datasets.split(",")
-            if value.strip()
-        ],
+        datasets=datasets,
         limit=args.longbench_limit,
         max_input_tokens=args.longbench_max_input_tokens,
         timeout=args.timeout,
@@ -549,6 +582,7 @@ def main() -> int:
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
         },
+        "input_manifest": input_manifest,
         "human_eval": human_eval,
         "longbench": longbench,
         "passed": passed,
