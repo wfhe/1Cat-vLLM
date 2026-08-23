@@ -1215,12 +1215,17 @@ int mxfp4_dense_tune_max_m() {
 
 int nvfp4_dense_tune_max_m() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return raw ? std::max(std::atoi(raw), 0) : 80;
 }
 
 int moe_tune_max_tokens() {
   const char* raw = std::getenv("VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS");
   return raw ? std::max(std::atoi(raw), 0) : 128;
+}
+
+int nvfp4_moe_tune_max_tokens() {
+  const char* raw = std::getenv("VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS");
+  return raw ? std::max(std::atoi(raw), 0) : 640;
 }
 
 int sm70_f16_dense_max_m() {
@@ -1320,8 +1325,11 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
-    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled) {
-  if (!tune_enabled || total_tokens > moe_tune_max_tokens()) {
+    cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
+    int max_tune_tokens = -1) {
+  const int tune_limit =
+      max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
+  if (!tune_enabled || total_tokens > tune_limit) {
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
 
@@ -1376,7 +1384,8 @@ turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
     cudaStream_t stream) {
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled());
+      TuneKeyKind::kNvfp4Moe, nvfp4_tune_small_shapes_enabled(),
+      nvfp4_moe_tune_max_tokens());
 }
 
 WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {

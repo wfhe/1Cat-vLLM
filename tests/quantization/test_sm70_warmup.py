@@ -181,14 +181,39 @@ def test_nvfp4_moe_warmup_includes_supported_cuda_graph_shapes():
     worker = SimpleNamespace(
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(
-                cudagraph_capture_sizes=[1, 2, 4, 5, 8, 9, 18, 20]
+                cudagraph_capture_sizes=[1, 2, 4, 5, 8, 9, 18, 20, 40, 60, 80, 81]
             )
         )
     )
 
     assert warmup._get_nvfp4_moe_token_counts(
         worker, [_nvfp4_moe_layer()], [1, 2, 4, 8]
-    ) == [1, 2, 4, 5, 8, 9, 18]
+    ) == [1, 2, 4, 5, 8, 9, 18, 20, 40, 60, 80]
+
+
+def test_nvfp4_dense_warmup_includes_tuned_cuda_graph_shapes():
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[1, 5, 10, 20, 40, 60, 80, 81]
+            )
+        )
+    )
+    state = SimpleNamespace(op_kind="nvfp4")
+
+    assert warmup._get_nvfp4_dense_m_values(worker, [state], [1, 2, 4, 8, 16]) == [
+        1,
+        2,
+        4,
+        5,
+        8,
+        10,
+        16,
+        20,
+        40,
+        60,
+        80,
+    ]
 
 
 def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b8(monkeypatch):
@@ -215,6 +240,33 @@ def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b8(monkeypatch):
     assert all(call[3].numel() == 256 for call in calls)
     assert calls[0][2][:73].tolist() == list(range(73))
     assert calls[0][2][73:].tolist() == [72] * (257 - 73)
+
+
+def test_nvfp4_moe_warmup_supports_mtp4_c16_width(monkeypatch):
+    layer = _nvfp4_moe_layer()
+    calls = []
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_moe_dense_stage_sm70_out", object(), raising=False
+    )
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_moe_dense_stage_sm70_out",
+        lambda *args: calls.append(args),
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "silu_and_mul",
+        lambda out, gate_up: out.zero_(),
+        raising=False,
+    )
+
+    assert warmup._warmup_nvfp4_moe_decode_layers([layer], [80]) == 2
+    assert [tuple(call[0].shape) for call in calls] == [(640, 256), (640, 2048)]
+    assert [call[6] for call in calls] == [256, 256]
+    offsets = calls[0][2]
+    assert offsets.numel() == 257
+    assert offsets[:4].tolist() == [0, 3, 6, 9]
+    assert offsets[-1].item() == 640
 
 
 def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):

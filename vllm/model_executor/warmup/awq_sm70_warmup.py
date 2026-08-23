@@ -709,8 +709,6 @@ def _warmup_nvfp4_moe_decode_layers(
         max_experts = int(layer.sm70_nvfp4_num_experts)
         for num_tokens in token_counts:
             total_slots = num_tokens * top_k
-            if total_slots > max_experts:
-                continue
             if num_tokens <= 8:
                 stage_experts = total_slots
                 expert_offsets = torch.arange(
@@ -719,14 +717,8 @@ def _warmup_nvfp4_moe_decode_layers(
                 active_expert_ids = layer._nvfp4_sm70_dense_expert_ids[:total_slots]
             else:
                 stage_experts = max_experts
-                expert_offsets = torch.full(
-                    (max_experts + 1,),
-                    total_slots,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                expert_offsets[: total_slots + 1] = torch.arange(
-                    total_slots + 1, dtype=torch.int32, device=device
+                expert_offsets = _build_balanced_offsets(
+                    total_slots, max_experts, device
                 )
                 active_expert_ids = layer._nvfp4_sm70_dense_expert_ids
             permuted_input = torch.empty(
@@ -792,13 +784,18 @@ def _get_nvfp4_moe_token_counts(
     moe_layers: list[torch.nn.Module],
     base_token_counts: list[int],
 ) -> list[int]:
-    """Include every NVFP4 CUDA-graph shape covered by persistent buffers."""
+    """Include graph-safe and tuned NVFP4 CUDA-graph token widths."""
     if not moe_layers:
         return base_token_counts
-    max_tokens = max(
+    graph_safe_max_tokens = max(
         int(getattr(layer, "sm70_nvfp4_graph_safe_max_tokens", 8))
         for layer in moe_layers
     )
+    max_top_k = max(int(layer.moe_config.experts_per_token) for layer in moe_layers)
+    tuned_max_tokens = max(0, int(envs.VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS)) // max(
+        max_top_k, 1
+    )
+    max_tokens = max(graph_safe_max_tokens, tuned_max_tokens)
     compilation_config = getattr(
         getattr(worker, "vllm_config", None), "compilation_config", None
     )
@@ -806,6 +803,25 @@ def _get_nvfp4_moe_token_counts(
     return sorted(
         set(base_token_counts)
         | {int(size) for size in capture_sizes if 0 < int(size) <= max_tokens}
+    )
+
+
+def _get_nvfp4_dense_m_values(
+    worker: Worker,
+    fp4_dense_layers: list[Any],
+    base_m_values: list[int],
+) -> list[int]:
+    """Include captured dense NVFP4 widths accepted by its tuner."""
+    if not any(state.op_kind == "nvfp4" for state in fp4_dense_layers):
+        return base_m_values
+    max_m = max(0, int(envs.VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M))
+    compilation_config = getattr(
+        getattr(worker, "vllm_config", None), "compilation_config", None
+    )
+    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or []
+    return sorted(
+        set(base_m_values)
+        | {int(size) for size in capture_sizes if 0 < int(size) <= max_m}
     )
 
 
@@ -994,13 +1010,14 @@ def sm70_awq_warmup(worker: Worker) -> None:
     nvfp4_moe_token_counts = _get_nvfp4_moe_token_counts(
         worker, nvfp4_moe_layers, moe_token_counts
     )
+    nvfp4_dense_m_values = _get_nvfp4_dense_m_values(worker, fp4_dense_layers, m_values)
     lut_path = _resolve_lut_path(device)
 
     logger.info(
         "Warming up SM70 TurboMind accepted routes (%d AWQ dense layer "
         "shapes, %d FP8 dense layer shapes, %d FP4 dense layer shapes, "
         "%d MoE layer shapes, %d MXFP4 MoE B1 layer shapes, "
-        "%d NVFP4 MoE layer shapes, dense_m=%s, "
+        "%d NVFP4 MoE layer shapes, dense_m=%s, nvfp4_dense_m=%s, "
         "moe_tokens=%s, nvfp4_moe_tokens=%s, lut_path=%s).",
         len(dense_layers),
         len(fp8_dense_layers),
@@ -1009,6 +1026,7 @@ def sm70_awq_warmup(worker: Worker) -> None:
         len(mxfp4_moe_layers),
         len(nvfp4_moe_layers),
         m_values,
+        nvfp4_dense_m_values,
         moe_token_counts,
         nvfp4_moe_token_counts,
         lut_path,
@@ -1020,7 +1038,13 @@ def sm70_awq_warmup(worker: Worker) -> None:
             m_values,
             device,
         )
-        fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
+        fp4_dense_calls = _warmup_fp4_dense_layers(
+            [state for state in fp4_dense_layers if state.op_kind == "mxfp4"],
+            m_values,
+        ) + _warmup_fp4_dense_layers(
+            [state for state in fp4_dense_layers if state.op_kind == "nvfp4"],
+            nvfp4_dense_m_values,
+        )
         moe_stage_calls = _warmup_moe_dense_stage_layers(moe_layers, moe_token_counts)
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
         mxfp4_moe_stage_calls = _warmup_mxfp4_moe_b1_layers(mxfp4_moe_layers)

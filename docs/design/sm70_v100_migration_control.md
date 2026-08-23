@@ -41737,3 +41737,36 @@ Interpretation:
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
+
+## 2026-08-24 Qwen3.6-35B NVFP4 MTP4 concurrency scaling
+
+- The formal workload uses ModelOpt mixed FP8/NVFP4, TP4 on V100 GPU0-3,
+  Flash-V100/FlashQLA, FP8-E5M2 KV cache, MTP4 probabilistic sampling with
+  local argmax, max length/batched tokens 8192, and 48 fixed ShareGPT requests
+  totaling 9,115 prompt and 10,623 output tokens. Forty-eight requests give
+  C16 three complete waves and remove the tail-underfill artifact in the
+  earlier 16-request localization sweep.
+- Current-main output throughput at C1/C2/C4/C8/C12/C16 is respectively
+  98.265/146.124/276.600/414.315/491.270/542.982 tok/s. Scaling efficiency
+  relative to C1 is 100.00%/74.35%/70.37%/52.70%/41.66%/34.54%. Mean MTP
+  acceptance length remains 2.887-2.955 and draft acceptance remains
+  47.18%-48.87%, so the scaling loss is not an acceptance collapse.
+- The old AWQ scheduling pair is rejected for this route. Shared-expert stream
+  overlap plus `all_reduce_sum2` regressed corrected C16 output 4.10%; isolated
+  overlap and sum2 regressed 4.66% and 4.06%. The pair also regressed C1 from
+  98.265 to 94.880 tok/s (3.45%). Leave both switches default-off for NVFP4.
+- MTP4 verifier width is five times request concurrency. Production warmup
+  currently stops at NVFP4 MoE M15 and dense M16, while captured C4/C8/C12/C16
+  shapes require M20/M40/M60/M80, or 160/320/480/640 routed rows.
+- Clean independent-process graph microbenchmarks on one exclusively claimed
+  V100 show measured routed-MoE W13/W2 speedups at M20/M40/M60/M80 of
+  1.107x/1.311x, 1.200x/1.179x, 1.195x/1.181x, and 1.177x/1.117x. Shared-dense
+  W13/W2 speedups are 1.742x/1.261x, 2.749x/1.181x, 2.004x/1.179x, and
+  1.519x/1.348x. All outputs are finite; maximum accumulation-order difference
+  is 6.104e-5, which still requires the dataset-level quality gate.
+- The bounded candidate raises only NVFP4 dense/MoE tune limits to M80 and 640
+  routed rows, derives warmup widths from the already-captured CUDA Graph
+  sizes, and builds balanced 256-expert offsets above 32 verifier tokens. It
+  does not change quantization, routing, attention, MTP acceptance, or sampling
+  semantics. Focused warmup tests pass; C16 full-model speed, the full six-point
+  curve, and GSM8K/ShareGPT quality remain required before acceptance.
