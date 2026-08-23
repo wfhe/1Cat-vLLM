@@ -88,7 +88,10 @@ def _sm70_mtp_profile_interval() -> int:
 
 
 def _sm70_mtp_moe_warmup_sizes(
-    num_experts: int, top_k: int, max_num_tokens: int
+    num_experts: int,
+    top_k: int,
+    max_num_tokens: int,
+    decode_tile_max_tokens: int = 0,
 ) -> tuple[int, ...]:
     """Pick one token count for each SM70 Triton MoE dispatch region."""
     if num_experts <= 0 or top_k <= 0 or max_num_tokens <= 0:
@@ -111,6 +114,7 @@ def _sm70_mtp_moe_warmup_sizes(
         # First shape using the large-M SM70 0.0.3 MoE tile.
         prefer_unaligned(num_experts + 1),
     }
+    sizes.update(range(1, min(decode_tile_max_tokens, max_num_tokens) + 1))
     return tuple(sorted(size for size in sizes if size <= max_num_tokens))
 
 
@@ -1014,11 +1018,23 @@ class SpecDecodeBaseProposer:
 
         text_config = self.draft_model_config.hf_text_config
         top_k = int(getattr(text_config, "num_experts_per_tok", 0))
+        num_experts = self.draft_model_config.get_num_experts()
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        use_qwen36_decode_tiles = (
+            envs.VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG
+            and num_experts == 256
+            and top_k == 8
+            and self.draft_model_config.get_hidden_size() == 2048
+            and int(getattr(text_config, "moe_intermediate_size", 0)) == 512
+            and tp_size == 4
+        )
         sizes = _sm70_mtp_moe_warmup_sizes(
-            self.draft_model_config.get_num_experts(),
+            num_experts,
             top_k,
             self.max_num_tokens,
+            decode_tile_max_tokens=16 if use_qwen36_decode_tiles else 0,
         )
+        legacy_sizes = (1, 2, 9, 10) if use_qwen36_decode_tiles else ()
         if not sizes:
             return ()
 
@@ -1029,12 +1045,34 @@ class SpecDecodeBaseProposer:
                     use_cudagraphs=False,
                     spec_step_idx=0,
                 )
+            if legacy_sizes:
+                # The tuned drafter tile replaces legacy graph
+                # specializations that used to be compiled incidentally.
+                # Other unquantized MoE calls can reuse those legacy Triton
+                # signatures during serving. Cover both token divisibility
+                # cases for the naive (M1/M2) and aligned (M9/M10) assignment
+                # paths instead of allowing a first-request JIT spike.
+                from vllm.model_executor.layers.fused_moe.fused_moe import (
+                    force_sm70_qwen36_mtp_moe_legacy_config,
+                )
+
+                with force_sm70_qwen36_mtp_moe_legacy_config():
+                    for num_tokens in legacy_sizes:
+                        self.dummy_run(
+                            num_tokens,
+                            use_cudagraphs=False,
+                            spec_step_idx=0,
+                        )
             torch.accelerator.synchronize()
         except Exception as err:  # pragma: no cover - best-effort warmup
             logger.warning_once("SM70 MTP MoE warmup skipped: %s", err)
             return ()
 
-        logger.info_once("SM70 MTP MoE warmup finished: token_counts=%s", sizes)
+        logger.info_once(
+            "SM70 MTP MoE warmup finished: token_counts=%s, legacy_token_counts=%s",
+            sizes,
+            legacy_sizes,
+        )
         return ("mtp_draft_moe",)
 
     def take_last_draft_probs(self) -> torch.Tensor | None:

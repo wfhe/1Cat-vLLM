@@ -1215,7 +1215,7 @@ int mxfp4_dense_tune_max_m() {
 
 int nvfp4_dense_tune_max_m() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M");
-  return raw ? std::max(std::atoi(raw), 0) : 80;
+  return raw ? std::max(std::atoi(raw), 0) : 16;
 }
 
 int moe_tune_max_tokens() {

@@ -167,7 +167,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_FP8_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M: int = 16
-    VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 80
+    VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_DSV4_FP16_GEMV: bool = False
     VLLM_SM70_DSV4_MHC_FP32_STAGE: bool = True
     VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS: int = 128
@@ -468,6 +468,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
+    VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG: bool = True
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -1699,7 +1700,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_MXFP4_DENSE_TUNE_MAX_M", "16")
     ),
     "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "80")
+        os.getenv("VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M", "16")
     ),
     "VLLM_SM70_DSV4_FP16_GEMV": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_FP16_GEMV", "0"))
@@ -2782,6 +2783,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG", "1"))
+    ),
+    # Decode-only tiles for the bundled Qwen3.6 E256/H2048/I128-per-TP4-rank
+    # top-k8 MTP drafter. Larger token counts retain the 0.0.3 prefill config.
+    "VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG": lambda: bool(
+        int(os.getenv("VLLM_SM70_QWEN36_MTP_MOE_TUNED_CONFIG", "1"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on

@@ -41755,8 +41755,8 @@ Interpretation:
   overlap plus `all_reduce_sum2` regressed corrected C16 output 4.10%; isolated
   overlap and sum2 regressed 4.66% and 4.06%. The pair also regressed C1 from
   98.265 to 94.880 tok/s (3.45%). Leave both switches default-off for NVFP4.
-- MTP4 verifier width is five times request concurrency. Production warmup
-  currently stops at NVFP4 MoE M15 and dense M16, while captured C4/C8/C12/C16
+- MTP4 verifier width is five times request concurrency. Before this work,
+  production warmup stopped at NVFP4 MoE M15 while captured C4/C8/C12/C16
   shapes require M20/M40/M60/M80, or 160/320/480/640 routed rows.
 - Clean independent-process graph microbenchmarks on one exclusively claimed
   V100 show measured routed-MoE W13/W2 speedups at M20/M40/M60/M80 of
@@ -41764,9 +41764,44 @@ Interpretation:
   W13/W2 speedups are 1.742x/1.261x, 2.749x/1.181x, 2.004x/1.179x, and
   1.519x/1.348x. All outputs are finite; maximum accumulation-order difference
   is 6.104e-5, which still requires the dataset-level quality gate.
-- The bounded candidate raises only NVFP4 dense/MoE tune limits to M80 and 640
-  routed rows, derives warmup widths from the already-captured CUDA Graph
-  sizes, and builds balanced 256-expert offsets above 32 verifier tokens. It
-  does not change quantization, routing, attention, MTP acceptance, or sampling
-  semantics. Focused warmup tests pass; C16 full-model speed, the full six-point
-  curve, and GSM8K/ShareGPT quality remain required before acceptance.
+- The high-width candidate raises only the NVFP4 MoE tune limit to 640 routed
+  rows, derives warmup widths from the already-captured CUDA Graph sizes, and
+  builds balanced 256-expert offsets above 32 verifier tokens. The dense-NVFP4
+  M80 extension was isolated and withdrawn; its default remains M16. In a
+  48-request C16 candidate/control/candidate sandwich, routed-MoE tuning
+  measured `535.635/524.376/539.113 tok/s`; the candidate endpoint mean is
+  `+2.48%`, summed pure decode is `+2.85%`, and P50 TPOT improves about `4.0%`
+  with stable MTP acceptance.
+- Two low-width target-MoE candidates are rejected. Directly reusing sorted
+  expert IDs instead of the compact metadata copy regressed the C1 sandwich;
+  splitting B9/B10 into correctness-bounded 64-slot compact chunks was
+  numerically healthy but `41.5%/10.3%` slower. Direct compact execution above
+  64 slots remains correctness-invalid and must not be retried.
+- A C1 Nsight graph-node trace identified the bundled unquantized MTP drafter
+  MoE as a separate `2.825 ms` per-cycle hotspot. An initial oracle incorrectly
+  used the checkpoint-global I512 shape. The first candidate startup log proved
+  that TP4 shards it to local I128 (`E=256,N=128` config lookup); the candidate
+  therefore did not route-hit and its full-model run was stopped before
+  measurement. The global-I512 speedups are not TP4 selection evidence. The
+  corrected local E256/H2048/I128/top-k8 M1-M16 graph oracle is bitwise equal
+  at every width. The isolated M1 operation improved `1.290x` by retaining
+  N32/K64 and reducing to two warps; M2-M16 select M8/N128/K32/W4/S3 and
+  improve `1.543x/2.656x/2.879x/2.697x/2.625x` at the formal
+  C2/C4/C8/C12/C16 widths.
+- The route-hit candidate initially exposed request-time old-tile MoE
+  signatures. Exact Qwen3.6 TP4 startup now warms tuned M1-M16 plus M33/M257
+  and explicitly covers legacy M1/M2/M9/M10 naive/aligned signatures; a fresh
+  48-request run then produced no inference-time `fused_moe_kernel` JIT. Other
+  MTP models retain the old `(9,33,257)` warmup set.
+- Full-model evidence rejects the isolated M1 result. A physical-GPU4-7 C1
+  candidate/control/candidate sandwich measured endpoint-mean summed pure
+  decode `112.233` versus control `115.451 tok/s` (`-2.79%`) and endpoint-mean
+  P50 TPOT `8.874` versus `8.758 ms` (`+1.33%`). M1 therefore retains the exact
+  0.0.3 tile; balanced single-GPU kernel means are not a substitute for TP4
+  rank-imbalance and synchronization behavior.
+- The narrowed M2-M16 candidate passes C2. Candidate/control/candidate output
+  was `154.865/147.180/163.480 tok/s`; endpoint mean is `+8.15%`. Summed pure
+  decode improves `+4.47%`, P50 TPOT is effectively flat (`+0.14%`), and mean
+  acceptance is lower than control rather than artificially favorable. M17+
+  retains the old prefill tile. The final six-point GPU0-3 curve and
+  GSM8K/ShareGPT quality remain required.

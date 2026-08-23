@@ -806,25 +806,6 @@ def _get_nvfp4_moe_token_counts(
     )
 
 
-def _get_nvfp4_dense_m_values(
-    worker: Worker,
-    fp4_dense_layers: list[Any],
-    base_m_values: list[int],
-) -> list[int]:
-    """Include captured dense NVFP4 widths accepted by its tuner."""
-    if not any(state.op_kind == "nvfp4" for state in fp4_dense_layers):
-        return base_m_values
-    max_m = max(0, int(envs.VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M))
-    compilation_config = getattr(
-        getattr(worker, "vllm_config", None), "compilation_config", None
-    )
-    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or []
-    return sorted(
-        set(base_m_values)
-        | {int(size) for size in capture_sizes if 0 < int(size) <= max_m}
-    )
-
-
 def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
     if not (
         hasattr(torch.ops._C, "awq_moe_single_token_dense_w13_sm70_out")
@@ -1010,14 +991,13 @@ def sm70_awq_warmup(worker: Worker) -> None:
     nvfp4_moe_token_counts = _get_nvfp4_moe_token_counts(
         worker, nvfp4_moe_layers, moe_token_counts
     )
-    nvfp4_dense_m_values = _get_nvfp4_dense_m_values(worker, fp4_dense_layers, m_values)
     lut_path = _resolve_lut_path(device)
 
     logger.info(
         "Warming up SM70 TurboMind accepted routes (%d AWQ dense layer "
         "shapes, %d FP8 dense layer shapes, %d FP4 dense layer shapes, "
         "%d MoE layer shapes, %d MXFP4 MoE B1 layer shapes, "
-        "%d NVFP4 MoE layer shapes, dense_m=%s, nvfp4_dense_m=%s, "
+        "%d NVFP4 MoE layer shapes, dense_m=%s, "
         "moe_tokens=%s, nvfp4_moe_tokens=%s, lut_path=%s).",
         len(dense_layers),
         len(fp8_dense_layers),
@@ -1026,7 +1006,6 @@ def sm70_awq_warmup(worker: Worker) -> None:
         len(mxfp4_moe_layers),
         len(nvfp4_moe_layers),
         m_values,
-        nvfp4_dense_m_values,
         moe_token_counts,
         nvfp4_moe_token_counts,
         lut_path,
@@ -1038,13 +1017,7 @@ def sm70_awq_warmup(worker: Worker) -> None:
             m_values,
             device,
         )
-        fp4_dense_calls = _warmup_fp4_dense_layers(
-            [state for state in fp4_dense_layers if state.op_kind == "mxfp4"],
-            m_values,
-        ) + _warmup_fp4_dense_layers(
-            [state for state in fp4_dense_layers if state.op_kind == "nvfp4"],
-            nvfp4_dense_m_values,
-        )
+        fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
         moe_stage_calls = _warmup_moe_dense_stage_layers(moe_layers, moe_token_counts)
         single_token_calls = _warmup_moe_single_token_layers(moe_layers)
         mxfp4_moe_stage_calls = _warmup_mxfp4_moe_b1_layers(mxfp4_moe_layers)

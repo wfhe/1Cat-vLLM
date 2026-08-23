@@ -191,31 +191,6 @@ def test_nvfp4_moe_warmup_includes_supported_cuda_graph_shapes():
     ) == [1, 2, 4, 5, 8, 9, 18, 20, 40, 60, 80]
 
 
-def test_nvfp4_dense_warmup_includes_tuned_cuda_graph_shapes():
-    worker = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(
-                cudagraph_capture_sizes=[1, 5, 10, 20, 40, 60, 80, 81]
-            )
-        )
-    )
-    state = SimpleNamespace(op_kind="nvfp4")
-
-    assert warmup._get_nvfp4_dense_m_values(worker, [state], [1, 2, 4, 8, 16]) == [
-        1,
-        2,
-        4,
-        5,
-        8,
-        10,
-        16,
-        20,
-        40,
-        60,
-        80,
-    ]
-
-
 def test_nvfp4_moe_warmup_uses_full_expert_groups_above_compact_b8(monkeypatch):
     layer = _nvfp4_moe_layer()
     calls = []
