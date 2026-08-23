@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1783,6 +1784,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
+    ),
+    # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
+    # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
+    "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,
