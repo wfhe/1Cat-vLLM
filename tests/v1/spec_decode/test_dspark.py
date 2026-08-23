@@ -165,3 +165,33 @@ def test_dspark_replicated_linears_return_tensors() -> None:
     markov_head.markov_w2 = nn.Identity()
     markov_embed = torch.randn(3, 4)
     assert torch.equal(markov_head.bias(markov_embed), markov_embed)
+
+
+def test_dspark_confidence_scheduler_keeps_only_confident_prefix() -> None:
+    proposer = object.__new__(DSparkProposer)
+    proposer._confidence_temperatures = torch.tensor([[1.0, 2.0, 1.0, 1.0, 1.0]])
+    proposer._confidence_threshold = 0.7
+    proposer._max_verification_tokens = 4
+    logits = torch.tensor(
+        [
+            [2.0, 2.0, 0.0, 4.0, 4.0],
+            [2.0, 4.0, 4.0, 4.0, 4.0],
+            [0.0, 4.0, 4.0, 4.0, 4.0],
+        ]
+    )
+
+    lengths = proposer._select_verification_lengths(logits)
+
+    assert lengths.dtype == torch.int32
+    assert lengths.tolist() == [2, 4, 0]
+
+
+def test_dspark_confidence_scheduler_zero_threshold_uses_cap() -> None:
+    proposer = object.__new__(DSparkProposer)
+    proposer._confidence_temperatures = torch.ones((1, 5))
+    proposer._confidence_threshold = 0.0
+    proposer._max_verification_tokens = 2
+
+    lengths = proposer._select_verification_lengths(torch.randn(3, 5))
+
+    assert lengths.tolist() == [2, 2, 2]

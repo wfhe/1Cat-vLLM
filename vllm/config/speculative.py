@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import math
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -285,6 +286,20 @@ class SpeculativeConfig:
     distribution and uses the full draft logits for the probability ratio test
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
+
+    dspark_confidence_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Conditional-acceptance threshold for DSpark prefix scheduling. A value
+    of zero keeps every proposed position. Positive values retain only the
+    leading positions whose calibrated confidence is at least the threshold."""
+
+    dspark_confidence_temperatures: list[float] | None = None
+    """Optional positive per-position temperatures applied to DSpark confidence
+    logits before prefix scheduling. The list must match num_speculative_tokens."""
+
+    dspark_max_verification_tokens: int | None = Field(default=None, ge=0)
+    """Optional cap on DSpark draft tokens submitted to target verification.
+    DSpark still generates the checkpoint's complete block; only a prefix is
+    scheduled, so values below the checkpoint block size remain lossless."""
 
     def compute_hash(self) -> str:
         """
@@ -864,6 +879,31 @@ class SpeculativeConfig:
                             f"{self.num_speculative_tokens}. Smaller values "
                             "produce incorrect output."
                         )
+                    if (
+                        self.dspark_max_verification_tokens is not None
+                        and self.dspark_max_verification_tokens
+                        > self.num_speculative_tokens
+                    ):
+                        raise ValueError(
+                            "dspark_max_verification_tokens must be <= "
+                            f"num_speculative_tokens ({self.num_speculative_tokens}); "
+                            f"got {self.dspark_max_verification_tokens}."
+                        )
+                    temperatures = self.dspark_confidence_temperatures
+                    if temperatures is not None:
+                        if len(temperatures) != self.num_speculative_tokens:
+                            raise ValueError(
+                                "dspark_confidence_temperatures must have length "
+                                f"{self.num_speculative_tokens}; got {temperatures}."
+                            )
+                        if not all(
+                            math.isfinite(value) and value > 0.0
+                            for value in temperatures
+                        ):
+                            raise ValueError(
+                                "dspark_confidence_temperatures entries must be "
+                                f"finite and positive; got {temperatures}."
+                            )
 
                 if self.use_dflash_ddtree() and self.ddtree_budget is None:
                     self.ddtree_budget = self.num_speculative_tokens

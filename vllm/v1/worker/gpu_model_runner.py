@@ -1387,6 +1387,23 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = bool(self.scheduler_config.async_scheduling)
+        self.dspark_confidence_scheduling = bool(
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and (
+                self.speculative_config.dspark_confidence_threshold > 0.0
+                or (
+                    self.speculative_config.dspark_max_verification_tokens is not None
+                    and self.speculative_config.dspark_max_verification_tokens
+                    < self.num_spec_tokens
+                )
+            )
+        )
+        if self.dspark_confidence_scheduling and self.use_async_scheduling:
+            raise ValueError(
+                "DSpark confidence prefix scheduling currently requires "
+                "synchronous scheduling."
+            )
         self._sm70_async_worker_execute_trace_step = 0
         self._sm70_async_worker_sample_trace_step = 0
         self._sm70_async_worker_input_prep_trace_step = 0
@@ -1784,6 +1801,15 @@ class GPUModelRunner(
         self._draft_confidence_logits: torch.Tensor | None = None
         self._draft_confidence_req_ids: list[str] | None = None
         self._draft_confidence_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._dspark_verification_lengths: torch.Tensor | None = None
+        self._dspark_verification_lengths_cpu: torch.Tensor | None = None
+        if self.dspark_confidence_scheduling:
+            self._dspark_verification_lengths_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
         self._dflash_ddtree_payloads: tuple[DDTreeDraftPayload, ...] | None = None
         self._ddtree_parent_metadata: DDTreeParentMetadata | None = None
         self._ddtree_accepted_rows_cpu_sidecar: list[list[int]] | None = None
@@ -8860,6 +8886,7 @@ class GPUModelRunner(
         self._draft_confidence_logits = None
         self._draft_confidence_req_ids = None
         self._draft_confidence_token_ids = None
+        self._dspark_verification_lengths = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
         self._ddtree_accepted_rows_cpu_sidecar = None
@@ -9006,6 +9033,7 @@ class GPUModelRunner(
                 self._draft_confidence_logits = None
                 self._draft_confidence_req_ids = None
                 self._draft_confidence_token_ids = None
+                self._dspark_verification_lengths = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
@@ -9310,6 +9338,15 @@ class GPUModelRunner(
                 self.draft_token_ids_cpu[:num_reqs].copy_(
                     draft_token_ids, non_blocking=True
                 )
+                if self.dspark_confidence_scheduling:
+                    lengths = self._dspark_verification_lengths
+                    lengths_cpu = self._dspark_verification_lengths_cpu
+                    if lengths is None or lengths_cpu is None:
+                        raise RuntimeError(
+                            "DSpark confidence scheduling is enabled but the "
+                            "proposer did not return verification lengths."
+                        )
+                    lengths_cpu[:num_reqs].copy_(lengths[:num_reqs], non_blocking=True)
             else:
                 # No copy needed, just zero-out cpu tensor.
                 self.draft_token_ids_cpu[:num_reqs] = 0
@@ -9330,7 +9367,16 @@ class GPUModelRunner(
             self.draft_token_ids_event,
             "GPUModelRunner.draft_token_ids_event.synchronize",
         )
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        if self.dspark_confidence_scheduling:
+            lengths_cpu = self._dspark_verification_lengths_cpu
+            assert lengths_cpu is not None
+            lengths = lengths_cpu[: len(req_ids)].tolist()
+            draft_token_ids = [
+                token_ids[: max(0, min(int(length), len(token_ids)))]
+                for token_ids, length in zip(draft_token_ids, lengths, strict=True)
+            ]
+        return draft_token_ids, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -9417,6 +9463,7 @@ class GPUModelRunner(
         self._draft_confidence_logits = None
         self._draft_confidence_req_ids = None
         self._draft_confidence_token_ids = None
+        self._dspark_verification_lengths = None
         self._dflash_ddtree_payloads = None
         self._ddtree_parent_metadata = None
         self._ddtree_accepted_rows_cpu_sidecar = None
@@ -9741,6 +9788,10 @@ class GPUModelRunner(
                     self._draft_confidence_token_ids = clone_draft_prob_token_ids(
                         draft_token_ids
                     )
+            if hasattr(self.drafter, "take_last_verification_lengths"):
+                verification_lengths = self.drafter.take_last_verification_lengths()
+                if verification_lengths is not None:
+                    self._dspark_verification_lengths = verification_lengths
             if hasattr(self.drafter, "take_last_ddtree_payloads"):
                 self._dflash_ddtree_payloads = self.drafter.take_last_ddtree_payloads()
                 first_payload = (

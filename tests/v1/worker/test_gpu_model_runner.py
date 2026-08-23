@@ -795,6 +795,25 @@ def test_sample_passes_reordered_draft_probs_to_rejection_sampler():
     assert torch.equal(passed_draft_probs, expected_draft_probs)
 
 
+def test_dspark_verification_lengths_trim_scheduler_drafts(monkeypatch):
+    runner = object.__new__(GPUModelRunner)
+    runner._draft_token_ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    runner._draft_token_req_ids = ["a", "b"]
+    runner.draft_token_ids_event = object()
+    runner.draft_token_ids_cpu = runner._draft_token_ids.clone()
+    runner.dspark_confidence_scheduling = True
+    runner._dspark_verification_lengths_cpu = torch.tensor([2, 0], dtype=torch.int32)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu_model_runner.sm70_trace_event_sync",
+        lambda *_args, **_kwargs: None,
+    )
+
+    token_ids, req_ids = runner._get_draft_token_ids_cpu()
+
+    assert req_ids == ["a", "b"]
+    assert token_ids == [[1, 2], []]
+
+
 @pytest.mark.skip_global_cleanup
 def test_sync_mamba_accepted_token_state_tracks_request_ownership():
     runner = object.__new__(GPUModelRunner)
