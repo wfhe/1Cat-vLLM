@@ -197,6 +197,35 @@ def test_v4_c128_boundary_detection():
     assert _get_c128_boundary(make_metadata([127, 10])) is True
 
 
+def test_sm70_private_compressor_state_requires_a_contiguous_single_request():
+    from vllm.models.deepseek_v4 import compressor
+
+    platform = MagicMock()
+    platform.is_cuda.return_value = True
+    platform.is_device_capability.return_value = True
+
+    config = MagicMock()
+    config.scheduler_config.max_num_seqs = 1
+    config.cache_config.enable_prefix_caching = False
+    config.parallel_config.pipeline_parallel_size = 1
+    config.kv_transfer_config = None
+    config.speculative_config.parallel_drafting = False
+
+    with patch.object(compressor, "current_platform", platform):
+        assert compressor._can_use_sm70_private_compressor_state(config)
+
+        config.speculative_config.parallel_drafting = True
+        assert not compressor._can_use_sm70_private_compressor_state(config)
+
+        config.speculative_config.parallel_drafting = False
+        config.scheduler_config.max_num_seqs = 2
+        assert not compressor._can_use_sm70_private_compressor_state(config)
+
+        config.scheduler_config.max_num_seqs = 1
+        config.cache_config.enable_prefix_caching = True
+        assert not compressor._can_use_sm70_private_compressor_state(config)
+
+
 def test_v4_c128_metadata_keeps_graph_stable_row_stride():
     from vllm.v1.attention.backends.mla import flashmla_sparse
 
