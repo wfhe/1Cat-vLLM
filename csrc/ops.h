@@ -698,7 +698,10 @@ void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
                               int64_t reducer_blocks);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t sm70_tp4_push_allreduce_buffer_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
+void register_sm70_tp4_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,

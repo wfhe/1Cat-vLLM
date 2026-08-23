@@ -328,3 +328,79 @@ captured 128-call chain, first sweeping the existing vLLM CTA/thread policy,
 then porting SGLang's two-epoch push buffer only if the policy sweep cannot
 close the gap. Bitwise FP32 accumulation order, CUDA-Graph registration, and
 all 128 collective dependencies are hard gates.
+
+### Sparse rejection end-to-end acceptance
+
+The matched Graph/Nsight run completed after the GPU group became available:
+
+- Result:
+  `results/dflash2-sparse-target-rejection-b1-nodes-o128-gpu0123-v1.json`.
+- SQLite:
+  `profiles/dflash2-sparse-target-rejection-b1-nodes-o128-gpu0123-v1.sqlite`.
+- Full synchronized round: **27.166 ms**, down from 27.951 ms by 0.785 ms.
+- Target-to-draft: **1.994 ms**, down from 2.738 ms by 0.744 ms.
+- Draft, draft-to-target, and target graph remain 4.004, 1.977, and
+  19.191 ms respectively.
+- All 128 output IDs and hash `fe0300...` match the accepted baseline. The
+  run records acceptance length 4.129 and per-position counts
+  `[27, 22, 18, 14, 9, 4, 3]`.
+
+This is a Type-A result for the narrow sparse route contract. The environment
+gate remains explicit until the default policy and paired dataset result are
+landed together.
+
+### TP4 push all-reduce audit
+
+The existing vLLM CTA/thread-policy sweep did not improve the 128-collective
+chain. A pinned SGLang-V100 checkout at `845b9fdf7a7e` measured its two-epoch
+one-shot push collective at 0.846-0.886 ms for the same 128-call
+`[8,5120]` FP16 chain, versus 1.854 ms for vLLM's pull path. A first vLLM port
+measured 0.873 ms and matched the FP32 rank-order reference numerically across
+eager, graph, and 128-call graph replay.
+
+Two issues prevented accepting that first port:
+
+1. Its temporary `_C` reused objects from the independent QPN8 worktree. Both
+   push-on and push-off runs first diverged from the accepted output at token
+   24, proving that those runs were not a clean source comparison.
+2. SGLang's positive-zero empty-slot sentinel converts an all-positive-zero
+   reduction to negative zero. A dedicated signed-zero probe found 40,960
+   bit mismatches despite zero numerical error. This can perturb later finite
+   arithmetic and is below the required bitwise gate.
+
+A release/acquire CTA-ready protocol fixed every payload bit for exact,
+random, model-like, positive-zero, and signed-zero inputs over a 128-call graph
+chain, but regressed the chain to 1.884-1.901 ms. It is rejected. The accepted
+microbenchmark candidate instead preinitializes the two data epochs with a
+reserved FP16 NaN payload and retains SGLang's fine-grained polling. Finite
+inputs, including both signed zeros, are never rewritten.
+
+The NaN-sentinel candidate passed the strict TP4 microbenchmark gate:
+
+- Artifact:
+  `results/vllm-push-ar-nan-sentinel-correctness-timing-m8-h5120-v1.json`.
+- Exact-integer, rank-marker, random-small, model-like, positive-zero, and
+  signed-zero inputs are bitwise equal to the fixed rank-order FP32 reference
+  in eager, one-call Graph, and 128-call Graph-chain modes on every rank.
+- The 128-call chain is **0.850-0.856 ms**, or about 1.00 ms faster than the
+  retained 1.854 ms vLLM pull chain. One call averages 6.64-6.68 microseconds
+  inside the chain.
+- The task-owned `_C` contains no QPN8 operator and has SHA256
+  `275594c0b38a358c1683efa1d6351e1c572d6da992789d3b5210a74ecbfce1e8`.
+
+The first unprofiled full-model run with that clean extension completed at
+176.56 steady decode token/s. Its 128 token IDs, hash `0cc12...`, acceptance
+length 4.467, and per-position accepted counts
+`[28, 23, 14, 13, 11, 8, 7]` exactly match the retained push-off control built
+with the current CUDA toolchain. They differ from the older `fe030...` release
+extension trajectory at token 24; both push-on and push-off current-toolchain
+builds make that same transition, so it is not attributed to the collective.
+The result is
+`results/dflash2-sparse-push-ar-nan-pure-b1-o128-gpu0123-v1.json`.
+
+A same-binary push-off rerun was invalidated when another task claimed the TP4
+group during model initialization, before KV-cache allocation; it produced no
+generation or performance result. The push route therefore remains
+default-off until that paired rerun and a clean Nsight complete-round trace are
+recorded. The microbenchmark establishes an expected roughly 1 ms graph saving,
+but the 176.56 token/s endpoint is not yet used as the paired throughput claim.
