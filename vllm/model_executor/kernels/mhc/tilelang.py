@@ -626,12 +626,14 @@ def mhc_fused_post_pre_tilelang(
         and use_fp16
         and capability is not None
         and capability.to_int() == 70
-        and num_tokens == 1
+        and 1 <= num_tokens <= 8
         and hidden_size == 4096
         and hc_mult == 4
         and hc_mult3 == 24
-        and tile_n == 2
-        and n_splits == 8
+        and (
+            (num_tokens < 8 and tile_n == 2 and n_splits == 8)
+            or (num_tokens == 8 and tile_n == 3 and n_splits == 4)
+        )
     )
 
     gemm_out_mul = torch.empty(

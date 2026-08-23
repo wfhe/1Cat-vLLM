@@ -154,7 +154,10 @@ def test_mhc_sm70_fp16_block_m_prenorm_keeps_rows_independent() -> None:
     ),
     reason="NVIDIA V100/SM70 and TileLang required",
 )
-def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise() -> None:
+@pytest.mark.parametrize("num_tokens", [1, 4, 7, 8])
+def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise(
+    num_tokens: int,
+) -> None:
     from vllm.model_executor.kernels.mhc.tilelang_kernels import (
         mhc_fused_tilelang,
         sm70_mhc_dot_from_fp32_stage_tilelang,
@@ -165,21 +168,26 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise() -> None:
     hidden_size = 4096
     hc_mult = 4
     hc_out = 24
-    n_splits = 8
+    tile_n = 2 if num_tokens < 8 else 3
+    n_splits = 8 if num_tokens < 8 else 4
     device = mhc_tilelang.current_platform.device_type
 
-    x = torch.randn((1, hidden_size), device=device, dtype=torch.float16)
+    x = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float16)
     residual = torch.randn(
-        (1, hc_mult, hidden_size), device=device, dtype=torch.float16
+        (num_tokens, hc_mult, hidden_size), device=device, dtype=torch.float16
     )
-    post_mix = torch.randn((1, hc_mult), device=device, dtype=torch.float32)
-    comb_mix = torch.randn((1, hc_mult, hc_mult), device=device, dtype=torch.float32)
+    post_mix = torch.randn((num_tokens, hc_mult), device=device, dtype=torch.float32)
+    comb_mix = torch.randn(
+        (num_tokens, hc_mult, hc_mult), device=device, dtype=torch.float32
+    )
     fn = torch.randn((hc_out, hc_mult, hidden_size), device=device, dtype=torch.float32)
 
     baseline_gemm = torch.empty(
-        (n_splits, 1, hc_out), device=device, dtype=torch.float32
+        (n_splits, num_tokens, hc_out), device=device, dtype=torch.float32
     )
-    baseline_sqrsum = torch.empty((n_splits, 1), device=device, dtype=torch.float32)
+    baseline_sqrsum = torch.empty(
+        (n_splits, num_tokens), device=device, dtype=torch.float32
+    )
     baseline_residual = torch.empty_like(residual)
     candidate_gemm = torch.empty_like(baseline_gemm)
     candidate_sqrsum = torch.empty_like(baseline_sqrsum)
@@ -198,7 +206,7 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise() -> None:
         hc_mult,
         hidden_size,
         hc_out,
-        tile_n=2,
+        tile_n=tile_n,
         n_splits=n_splits,
         use_fp16=True,
     )
@@ -221,7 +229,7 @@ def test_mhc_sm70_fp32_stage_matches_fused_decode_bitwise() -> None:
         hidden_size,
         hc_mult,
         hc_out,
-        tile_n=2,
+        tile_n=tile_n,
         n_splits=n_splits,
     )
     torch.cuda.synchronize()
