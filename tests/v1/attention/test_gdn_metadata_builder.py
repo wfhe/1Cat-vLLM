@@ -36,6 +36,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     build_gdn_spec_decode_state_contract,
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
+    prepare_dflash2_gdn_group_metadata,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -173,6 +174,7 @@ def _create_gdn_builder(
     use_full_cuda_graph: bool = False,
     mamba_cache_mode: str = "none",
     max_cudagraph_capture_size: int = 4,
+    device: torch.device = DEVICE,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(model_name=model_name, block_size=BLOCK_SIZE)
@@ -197,7 +199,7 @@ def _create_gdn_builder(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
 
 
@@ -486,6 +488,181 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
     )
 
     _assert_gdn_metadata_equal(actual, expected)
+
+
+def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13]], dtype=torch.int32, device=DEVICE
+        ),
+        num_actual_tokens=4,
+    )
+    num_accepted_tokens = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    num_decode_draft_tokens_cpu = torch.tensor([2], dtype=torch.int32, device="cpu")
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=builder.num_spec_state_tokens,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+    prepared = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+
+    actual = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+        prepared_dflash2_metadata=prepared,
+    )
+    assert actual is prepared
+
+    other_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    with pytest.raises(ValueError, match="does not belong"):
+        other_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            common_gdn_metadata=common_metadata,
+            prepared_dflash2_metadata=prepared,
+        )
+
+
+def test_dflash2_fused_gdn_group_metadata_replay(
+    monkeypatch,
+    local_gdn_model,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        pytest.skip("the fused GDN metadata kernel is SM70-only")
+
+    # The accepted DFlash2 verifier keeps the legacy spec-core operator off.
+    # Fused metadata must therefore own its graph-stable buffers independently.
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "1")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            max_cudagraph_capture_size=16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    width = builders[0].num_spec_state_tokens + 1
+    assert width == 8
+    query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+    query_start_loc_cpu = query_start_loc.cpu()
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([7, 7], dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=7,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+
+    block_tables = (
+        torch.arange(10, 10 + 2 * width, dtype=torch.int32, device=device).view(
+            2, width
+        ),
+        torch.arange(100, 100 + 2 * width, dtype=torch.int32, device=device).view(
+            2, width
+        ),
+    )
+    accepted = torch.tensor([3, 5], dtype=torch.int32, device=device)
+    for builder in builders:
+        builder.spec_state_indices_tensor.fill_(777)
+
+    first_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=None,
+    )
+    assert first_result is not None
+    prepared, descriptor = first_result
+    torch.cuda.synchronize(device)
+
+    for group_id, builder in enumerate(builders):
+        state = prepared[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        torch.testing.assert_close(state[:2], block_tables[group_id], rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
+    first = prepared[id(builders[0])]
+    assert first.spec_query_start_loc is not None
+    assert first.spec_query_start_loc.tolist() == [0, 8, 16] + [16] * 14
+    assert first.num_accepted_tokens is not None
+    assert first.num_accepted_tokens.tolist() == [3, 5] + [1] * 14
+    assert first.spec_state_slot_selectors is not None
+    assert first.spec_state_slot_selectors.tolist() == [3, 5] + [1] * 14
+    assert first.spec_sequence_masks is not None
+    assert first.spec_sequence_masks.tolist() == [True, True] + [False] * 14
+
+    # Poison every persistent output and replay with new source values. This
+    # catches stale graph-tail data and accidental reuse of one group's table.
+    for builder in builders:
+        builder.spec_state_indices_tensor.fill_(888)
+    common_buffers = builders[0]._ddtree_fast_common_buffers
+    assert common_buffers is not None
+    common_buffers.spec_sequence_masks.fill_(True)
+    common_buffers.spec_query_start_loc.fill_(-1)
+    common_buffers.num_accepted_tokens.fill_(-1)
+    common_buffers.spec_state_slot_selectors.fill_(-1)
+    block_tables[0].add_(1000)
+    block_tables[1].add_(2000)
+    accepted.copy_(torch.tensor([7, 2], dtype=torch.int32, device=device))
+
+    second_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=descriptor,
+    )
+    assert second_result is not None
+    replayed, replay_descriptor = second_result
+    assert replay_descriptor is descriptor
+    torch.cuda.synchronize(device)
+    for group_id, builder in enumerate(builders):
+        state = replayed[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        torch.testing.assert_close(state[:2], block_tables[group_id], rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
+    assert replayed[id(builders[0])].num_accepted_tokens is not None
+    assert replayed[id(builders[0])].num_accepted_tokens.tolist() == [7, 2] + [1] * 14
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):

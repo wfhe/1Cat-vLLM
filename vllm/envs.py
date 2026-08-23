@@ -177,6 +177,8 @@ if TYPE_CHECKING:
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
     VLLM_SM70_DFLASH2_FUSED_SELECTOR: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -1750,6 +1752,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with identical weights, prompts, and sampling configuration.
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))
+    ),
+    # Build all DFlash2 target GDN state-index metadata with one pointer-table
+    # Triton launch. Keep separate from the shared-classification gate until
+    # the fixed-trajectory and mixed-batch Graph checks pass.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    ),
+    # Debug-only oracle: materialize the legacy advanced-indexing contract and
+    # compare it with the fused persistent buffers before graph replay.
+    "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))
     ),
     # DFlash2-only packed GDN target-verification kernel. This is deliberately
     # independent from the shared-metadata umbrella gate so each optimization
