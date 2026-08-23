@@ -178,6 +178,10 @@ shared runtime environment. Every quality artifact includes SHA-256 hashes for
 the HumanEval tasks, LongBench prompt/max-length configs, and each selected
 dataset. LongBench records retain their source-row indices so the matched
 no-speculation and DSpark scores cannot silently use different samples.
+`benchmarks/compare_dsv4_quality_results.py` then rejects any reference-pass to
+candidate-fail transition in HumanEval, GSM8K, an individual LongBench row, or
+either final/anywhere needle retrieval. Aggregate scores alone cannot hide a
+per-sample regression.
 
 ## Rejected or Deferred Paths
 
