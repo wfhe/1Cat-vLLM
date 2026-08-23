@@ -84,6 +84,9 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     residual: torch.Tensor | None,
     weight: torch.Tensor,
 ) -> bool:
+    # Keep the dynamic token dimension out of this Python predicate. AOT traces
+    # the target once at a large warmup shape; a decode-only row bound would be
+    # constant-folded there and would leave the M=8 replay on the decomposed path.
     return bool(
         envs.VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS
         and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
@@ -93,7 +96,6 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
         and residual.dtype == torch.float32
         and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.ndim == 2
-        and 0 < x.shape[0] <= 64
         and x.shape[1] == 5120
         and residual.shape == x.shape
         and x.is_contiguous()
