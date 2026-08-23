@@ -2220,6 +2220,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_fused_gdn_split = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+        )
         self.compare_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
         )
@@ -2316,6 +2321,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if self.enable_sm70_dflash2_fused_gdn_norm:
             logger.info_once(
                 "SM70 DFlash2 one-pass GDN output RMSNorm route enabled.",
+                scope="local",
+            )
+        if self.enable_sm70_dflash2_fused_gdn_split:
+            logger.info_once(
+                "SM70 DFlash2 fused GDN z/b/a materialization route enabled.",
                 scope="local",
             )
         if envs.is_set("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING"):
