@@ -482,6 +482,20 @@ Goal:
   numerically equivalent verifier kernel. ReplaySSM remains a later high-batch
   research lane, not a substitute for the current single-request verification
   cost gate.
+- The first persistent pointer-table implementation has now passed an isolated
+  SM70 microbenchmark at the production block-eight width and ten target GDN
+  cache groups. It overwrites group-specific state IDs plus every shared live
+  and padded field in one Triton launch and remains bitwise equal to the legacy
+  contract after poisoning all persistent outputs. On an otherwise-idle V100,
+  the B1 legacy fan-out uses 400 CUDA launches and 5.360 ms synchronized-wall
+  p50 versus one launch and 0.354 ms for the fused path, a 15.13x speedup and
+  5.006 ms local saving. B2 is 5.360 versus 0.358 ms and B4 is 5.346 versus
+  0.354 ms, both about 15x. A separate lower-bound probe measures the raw fused
+  kernel at 0.056 ms wall / 0.040 ms GPU p50; roughly 0.305 ms remains in Python
+  eligibility, pointer validation, and metadata-view construction. These are
+  microbenchmark results, not yet an endpoint round-cost claim. The benchmark
+  is `benchmarks/benchmark_sm70_dflash2_gdn_metadata.py`; an unprofiled TP4
+  fixed-trajectory run remains required before default enablement.
 
 Main implementation priority:
 
