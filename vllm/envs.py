@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_COORDINATED_TUNING: bool = True
     VLLM_SM70_FP8_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_FP8_SAFE_FAST_SELECTOR: bool = False
+    VLLM_SM70_FP8_QWEN38_PREFILL_FAST_SELECTOR: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
@@ -1658,6 +1659,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_FP8_SAFE_FAST_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_SAFE_FAST_SELECTOR", "0"))
+    ),
+    "VLLM_SM70_FP8_QWEN38_PREFILL_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_QWEN38_PREFILL_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))

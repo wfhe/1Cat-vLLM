@@ -81,6 +81,13 @@ bool Sm70AwqMtpM5FastSelectorEnabled()
     return !raw || std::atoi(raw) != 0;
 }
 
+// Default-on gate for the exact TP4 Qwen3.8 FP8 8K prefill projections.
+bool Sm70Fp8Qwen38PrefillFastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_FP8_QWEN38_PREFILL_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
+}
+
 bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()
 {
     const char* grouped = std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8");
@@ -172,6 +179,12 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc
     if (awq_fast_selector_enabled) {
         if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
             return target;
+        }
+    }
+    if (Sm70Fp8Qwen38PrefillFastSelectorEnabled()) {
+        if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1"
+            || desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
+            return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, ""};
         }
     }
     if (!awq_fast_selector_enabled) {
