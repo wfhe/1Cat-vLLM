@@ -72,6 +72,39 @@ their stated end-to-end promotion gate:
    semantics. The captured-graph test, shorter dynamic replay, graph-tail mask,
    and workspace-width gate pass on V100.
 
+5. A default-off `VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER=1` route extends the
+   single-launch, one-row-per-slot MXFP4 contract from M=8 to M=2..M=8. This is
+   required before a shorter or confidence-scheduled DSpark block can reduce
+   verifier latency; the previous M=2..M=7 path launched one operation per
+   compact expert and erased the benefit of verifying fewer rows.
+
+The focused M=5 and M=6 CUDA Graph gates covered mixed overlap, all-distinct
+slots, and six hot experts. Slot grouping and real-expert grouping were bitwise
+at every pipeline stage and after a changed-route replay in all six cases. The
+mixed-route results are:
+
+| Verifier rows | Active-expert loop | Slot grouped | Real-expert grouped |
+|---:|---:|---:|---:|
+| M=5, 22 unique of 30 slots | 1.98837 ms | 0.18552 ms | 0.18000 ms |
+| M=6, 26 unique of 36 slots | 1.32993 ms | 0.34895 ms | 0.27260 ms |
+
+All-distinct expert grouping is slightly slower than slot grouping
+(`+0.121 ms` projected over 43 layers at M=5 and `+0.210 ms` at M=6), so the
+full-model route must report the observed production overlap. Evidence is
+retained under `/data/models/dsv4-verifier-20ms-variable-grouped-r1`; the
+single V100 was released after the gate.
+
+The 0731 checkpoint declares an official DSpark block size of five and stores
+`mtp.2.confidence_head.proj.weight`. The current runtime explicitly discards
+that weight. DeepSpec computes conditional step probabilities with a sigmoid,
+uses their cumulative product for prefix reliability reporting, and truncates
+at the first conditional probability below a threshold. Before production
+confidence scheduling, this runtime must first collect calibration data on the
+pinned datasets and profile M=2..M=8 service; a raw uncalibrated threshold is
+not an acceptance or latency proof. Static N=4/N=5 trials use the same strict
+rejection sampler and therefore preserve the target distribution while the
+hardware width crossover is measured.
+
 The indexer crossover gate uses FP32 scores, signed head weights, top-k 512,
 M=8, H=64, D=128, and CUDA Graph replay:
 
@@ -142,5 +175,5 @@ shared runtime environment.
 - private rings: `/data/models/dsv4-verifier-20ms-private-ring-source-gate-r1`
 - indexer crossover: `/data/models/dsv4-verifier-20ms-indexer-crossover-r3`
 - indexer source gate: `/data/models/dsv4-verifier-20ms-indexer-source-gate-r1`
+- M=5/M=6 grouped verifier: `/data/models/dsv4-verifier-20ms-variable-grouped-r1`
 - rejected TP8 all-reduce: `/data/models/dsv4-verifier-20ms-tp8-ar-screen-r1`
-

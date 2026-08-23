@@ -557,16 +557,19 @@ def benchmark_verifier_m8_pipeline(
     *,
     num_experts: int,
     top_k: int,
+    verifier_tokens: int,
     repeats: int,
     seed: int,
     route_case: str = "mixed",
     input_scale: float = 0.01,
     require_grouped_bitwise: bool = True,
 ) -> dict[str, object]:
-    """Compare dense-256, active-48 loop, and grouped verifier pipelines."""
-    num_tokens = 8
+    """Compare dense, active-loop, and grouped verifier pipelines."""
+    num_tokens = int(verifier_tokens)
     if num_experts != 256 or top_k != 6:
         raise ValueError("The verifier benchmark requires 256 experts/top-k=6")
+    if not 2 <= num_tokens <= 8:
+        raise ValueError("The verifier benchmark requires M in [2, 8]")
 
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -676,10 +679,13 @@ def benchmark_verifier_m8_pipeline(
         buffers: dict[str, torch.Tensor],
         *,
         active_only: bool,
-        grouped_m8: bool,
+        grouped_verifier: bool,
         expert_rows: bool = False,
     ) -> None:
-        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8"] = "1" if grouped_m8 else "0"
+        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8"] = "0"
+        os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER"] = (
+            "1" if grouped_verifier else "0"
+        )
         os.environ["VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS"] = (
             "1" if expert_rows else "0"
         )
@@ -706,7 +712,7 @@ def benchmark_verifier_m8_pipeline(
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"])
         if active_only:
             stage_offsets = buffers["compact_offsets"]
-            if grouped_m8:
+            if grouped_verifier:
                 if expert_rows:
                     _compact_mxfp4_active_experts(
                         buffers["permuted_experts_id"],
@@ -765,19 +771,19 @@ def benchmark_verifier_m8_pipeline(
         )
 
     def dense_call() -> None:
-        pipeline_call(dense, active_only=False, grouped_m8=False)
+        pipeline_call(dense, active_only=False, grouped_verifier=False)
 
     def active_call() -> None:
-        pipeline_call(active, active_only=True, grouped_m8=False)
+        pipeline_call(active, active_only=True, grouped_verifier=False)
 
     def grouped_call() -> None:
-        pipeline_call(grouped, active_only=True, grouped_m8=True)
+        pipeline_call(grouped, active_only=True, grouped_verifier=True)
 
     def expert_grouped_call() -> None:
         pipeline_call(
             expert_grouped,
             active_only=True,
-            grouped_m8=True,
+            grouped_verifier=True,
             expert_rows=True,
         )
 
@@ -923,7 +929,7 @@ def benchmark_verifier_m8_pipeline(
     if not base_gate_passed or (
         require_grouped_bitwise and not grouped_bitwise_gate_passed
     ):
-        raise RuntimeError(f"MXFP4 verifier M8 correctness gate failed: {result}")
+        raise RuntimeError(f"MXFP4 verifier correctness gate failed: {result}")
     return result
 
 
@@ -1063,6 +1069,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--full-pipeline", action="store_true")
     parser.add_argument("--verifier-m8-pipeline", action="store_true")
     parser.add_argument(
+        "--verifier-tokens",
+        type=int,
+        choices=range(2, 9),
+        default=8,
+        help="Target verifier row count M for the grouped pipeline gate.",
+    )
+    parser.add_argument(
         "--allow-grouped-numeric-drift",
         action="store_true",
         help=(
@@ -1073,7 +1086,7 @@ def parse_args() -> argparse.Namespace:
         "--route-case",
         choices=("mixed", "unique48", "hot6", "all"),
         default="mixed",
-        help="Verifier M8 expert-overlap distribution.",
+        help="Verifier expert-overlap distribution.",
     )
     parser.add_argument(
         "--profile-active-once",
@@ -1101,6 +1114,7 @@ def main() -> int:
             route_case: benchmark_verifier_m8_pipeline(
                 num_experts=args.num_experts,
                 top_k=args.top_k,
+                verifier_tokens=args.verifier_tokens,
                 repeats=args.repeats,
                 seed=args.seed + index,
                 route_case=route_case,
@@ -1112,7 +1126,7 @@ def main() -> int:
         print(
             json.dumps(
                 {
-                    "benchmark": "sm70_mxfp4_moe_verifier_m8_pipeline",
+                    "benchmark": "sm70_mxfp4_moe_verifier_pipeline",
                     "device": torch.cuda.get_device_name(),
                     "result": result,
                 },

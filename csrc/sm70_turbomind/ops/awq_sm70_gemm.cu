@@ -1081,6 +1081,12 @@ bool mxfp4_moe_grouped_m8_enabled() {
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
+bool mxfp4_moe_grouped_verifier_enabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
 bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
   const char* raw =
       std::getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS");
@@ -7519,7 +7525,8 @@ void mxfp4_moe_gemm_sm70_out_impl(
   op.batch_dim = 0;
   op.dispatch_num_override = compact_grouped_rows ? 1 : 0;
   const bool dynamic_expert_rows =
-      compact_grouped_rows && num_experts == 48 &&
+      compact_grouped_rows && num_experts >= 12 && num_experts <= 48 &&
+      num_experts % 6 == 0 &&
       vllm::awq_sm70::mxfp4_moe_grouped_m8_expert_rows_enabled();
   // The negative active-group contract is valid only when every group owns
   // exactly one row (for example compact B1/top-6 and slot-grouped M8). Real
@@ -7599,7 +7606,13 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
   const bool grouped_m8_shape =
       input.size(0) == 48 && num_experts == 48 &&
       ((k == 4096 && n == 512) || (k == 256 && n == 4096));
-  if (vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) {
+  const bool grouped_verifier_shape =
+      input.size(0) == num_experts && num_experts >= 12 &&
+      num_experts <= 48 && num_experts % 6 == 0 &&
+      ((k == 4096 && n == 512) || (k == 256 && n == 4096));
+  if ((vllm::awq_sm70::mxfp4_moe_grouped_m8_enabled() && grouped_m8_shape) ||
+      (vllm::awq_sm70::mxfp4_moe_grouped_verifier_enabled() &&
+       grouped_verifier_shape)) {
     // Keep every routed slot as an independent one-row group. Repeated experts
     // reuse the same weight pointer row, while the scheduler retains the exact
     // arithmetic contract already accepted for compact B1 decode.

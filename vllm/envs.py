@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
     VLLM_SM70_MXFP4_MOE_COMPACT_GROUPED_DECODE: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8: bool = False
+    VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS: bool = False
     VLLM_SM70_MXFP4_MOE_GROUPED_M8_FAST_SELECTOR: bool = True
     VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE: bool = False
@@ -1920,6 +1921,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # active-expert stage calls into one TurboMind grouped launch.
     "VLLM_SM70_MXFP4_MOE_GROUPED_M8": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_M8", "0"))
+    ),
+    # Extend the one-launch grouped verifier route from M=8 to M=2..M=8.
+    # Kept independent until each width passes its CUDA Graph and model gates.
+    "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER": lambda: bool(
+        int(os.getenv("VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER", "0"))
     ),
     # Group verifier slots routed to the same expert into one multi-row group.
     # This changes the MXFP4 reduction tactic, so it stays behind an

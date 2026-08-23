@@ -351,6 +351,45 @@ def test_mxfp4_sm70_m8_expert_grouped_dispatch_keeps_real_segments(monkeypatch):
     assert count == 48
 
 
+@pytest.mark.parametrize("expert_rows", [False, True])
+def test_mxfp4_sm70_m5_grouped_dispatch(expert_rows, monkeypatch):
+    buffers = {
+        "compact_expert_offsets": torch.arange(31, dtype=torch.int32) * 2,
+        "slot_expert_offsets": torch.arange(31, dtype=torch.int32),
+        "permuted_experts_id": torch.arange(30, dtype=torch.int32).flip(0),
+        "active_expert_ids": torch.arange(30, dtype=torch.int32),
+        "expert_offsets": torch.arange(257, dtype=torch.int32),
+        "dense_expert_ids": torch.arange(256, dtype=torch.int32),
+    }
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
+    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_verifier_enabled", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_moe,
+        "_mxfp4_grouped_m8_expert_rows_enabled",
+        lambda: expert_rows,
+    )
+
+    offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
+        buffers,
+        num_tokens=5,
+        num_experts=256,
+        fully_replicated_experts=True,
+    )
+
+    expected_offsets = (
+        buffers["compact_expert_offsets"]
+        if expert_rows
+        else buffers["slot_expert_offsets"]
+    )
+    expected_ids = (
+        buffers["active_expert_ids"] if expert_rows else buffers["permuted_experts_id"]
+    )
+    assert offsets is expected_offsets
+    assert expert_ids is expected_ids
+    assert count == 30
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires NVIDIA V100/SM70",
