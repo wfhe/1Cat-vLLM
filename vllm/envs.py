@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
+    VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_MXFP4_TURBOMIND: bool = True
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1: bool = False
     VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS: int = 8
@@ -1851,6 +1852,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # non-TurboMind route for diagnostics.
     "VLLM_SM70_NVFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TURBOMIND", "1"))
+    ),
+    # Dispatch all 256 routed experts in one grouped TurboMind call for the
+    # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps
+    # the compact active-expert route; larger graph shapes use full groups.
+    "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1"))
     ),
     "VLLM_SM70_MXFP4_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_MXFP4_TURBOMIND", "1"))
