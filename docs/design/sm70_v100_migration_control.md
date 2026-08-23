@@ -41720,14 +41720,21 @@ Interpretation:
   Flash-V100 XQA, QPN8 split-12 for the K1536 x N5120 output projection, and
   an exact B1/G6/D256 E4M3 p64 attention partition.
 - Frozen TP4 I1024/O256, E4M3 KV, official random sampling, no-MTP, and full
-  CUDA graph decode is **71.732 tok/s** at **13.941 ms/token** with the native
-  sampler. The clean p128 control is 69.904 tok/s at 14.305 ms/token.
+  CUDA graph decode first measured 71.732 tok/s at 13.941 ms/token with the
+  native sampler. After merging current `onecat/main` at `675a12dedc` and
+  rebuilding Flash-V100, the frozen request reconfirmed **71.342 tok/s** at
+  **14.017 ms/token**. The clean p128 control is 69.904 tok/s at
+  14.305 ms/token.
 - The p64 operator sweep saves 9.55-16.98 us per attention launch from sequence
   lengths 1025-2049. All p64/p128 cases stay within one FP16 output ULP of the
   scalar reference; the focused GPU suite passes 6/6.
 - Compact and fused top-k20 sampler experiments were removed because their
   sampled trajectories were not deterministic against the native route. They
-  are not part of the 71.732 tok/s claim.
+  are not part of either accepted p64 result.
+- Post-merge checks pass: 12/12 focused CPU policy/dispatch cases, 6/6 E4M3
+  XQA GPU numerical cases, Ruff lint/format, and `git diff --check`. The final
+  `_C` and Flash-V100 SHA256 values are `e0ea14d0...7624` and
+  `b418fed8...dce7`.
 - Full contract, route map, staged results, profile table, numerical evidence,
   rejected paths, rollback controls, and artifacts are in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.

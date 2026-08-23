@@ -13,9 +13,9 @@ this document credits a Marlin fallback.
 
 The final route also adds E4M3 KV support to Flash-V100 XQA and selects a p64
 partition for the exact batch-one, G6/D256 layout. This is the change that
-makes the frozen native-sampler result comfortably exceed 70 tok/s. The p64
-route is restricted to E4M3, batch one, G6/D256; the existing E5M2 and FP16
-policies are unchanged.
+makes the frozen native-sampler result exceed 70 tok/s. The p64 route is
+restricted to E4M3, batch one, G6/D256; the existing E5M2 and FP16 policies
+are unchanged.
 
 ## Frozen Contract
 
@@ -62,14 +62,16 @@ the previous E4M3 attention partition.
 | E4M3 XQA p128 | 67.880 tok/s | 14.732 ms |
 | NVFP4 N32 selectors | 69.991 tok/s | 14.288 ms |
 | Clean final binaries, native sampler, E4M3 p128 | 69.904 tok/s | 14.305 ms |
-| Clean final binaries, native sampler, E4M3 p64 | **71.732 tok/s** | **13.941 ms** |
+| Clean pre-merge binaries, native sampler, E4M3 p64 | 71.732 tok/s | 13.941 ms |
+| Merged-source confirmation, native sampler, E4M3 p64 | **71.342 tok/s** | **14.017 ms** |
 
-The final request generated all 256 tokens, contained no EOS, and finished by
-length. Relative to the immediately preceding clean-p128 control, p64 saves
-0.365 ms/token and improves pure decode by 2.61%. Both runs used physical GPUs
-0-3 under an exclusive reservation, the same `_C`, model/config, sampling,
-TurboMind/QPN8 selectors, and graph policy. Only the rebuilt Flash extension
-and E4M3 partition selector differ.
+Both p64 requests generated all 256 tokens, contained no EOS, and finished by
+length. Relative to the immediately preceding clean-p128 control, the
+pre-merge p64 run saves 0.365 ms/token and improves pure decode by 2.61%.
+After merging `onecat/main` at `675a12dedc`, rebuilding Flash-V100, and
+repeating the frozen request under an exclusive four-GPU reservation, p64
+measures 71.342 tok/s at 14.017 ms/token. This merged-source confirmation is
+the conservative final speed claim.
 
 Sampled token identity is not an attention quality criterion: one-output-ULP
 changes can flip a low-margin random sample. The final p64 stream is coherent
@@ -127,8 +129,8 @@ result is used for the final speed claim.
 - A compact top-k20 Python sampler reduced traced sampler service, but its
   random-sampling trajectory was not deterministic against the native route.
   A fused CUDA top20 candidate had the same acceptance problem. Both were
-  removed from production source; the final 71.732 tok/s result uses the
-  native sampler.
+  removed from production source; both final p64 results use the native
+  sampler.
 - Replacing only the full-vocabulary sort while retaining both native
   full-vocabulary softmax operations saved 53.9 us in isolation, insufficient
   for a stable acceptance margin. A one-full-softmax hybrid stayed
@@ -140,7 +142,7 @@ result is used for the final speed claim.
 - Final `_C` SHA256:
   `e0ea14d0e40330b08a9951e67634e50b722540d5d1bbb48500f690323ab07624`.
 - Final p64 Flash-V100 SHA256:
-  `1fa566a28961d0585a9b6e1ee39e8fa637c4fe13ae894a9a9c07e09d850d02ca`.
+  `b418fed86b9c1ab9297c8795c24732818239b9a3aaca5ec9efb60933853d8ce7`.
 - Focused CPU policy/dispatch tests: 12/12 passed (nine FP8/QPN8 and three
   E4M3 p64 policy cases).
 - Focused E4M3 XQA GPU numerical tests: 6/6 passed.
@@ -148,5 +150,7 @@ result is used for the final speed claim.
   `git diff --check` pass for the changed files.
 - Retained task evidence is under
   `.artifacts/qwen38_nvfp4_speed_20260823/`, notably the final p128/p64 JSON
-  results, `e4m3_xqa_p64_vs_p128_clean.json`, and the parsed per-token Nsight
-  tables under `profiles/`.
+  results, the merged confirmation
+  `final_merged_qwen38_nvfp4_tm_e4m3_xqa_p64_native_sampler_full_graph_i1k_o256.json`,
+  `e4m3_xqa_p64_vs_p128_clean.json`, and the parsed per-token Nsight tables
+  under `profiles/`.
