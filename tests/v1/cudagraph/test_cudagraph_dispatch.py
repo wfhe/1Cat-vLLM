@@ -456,6 +456,60 @@ class TestCudagraphDispatcher:
         )
         assert not explicitly_disabled.has_attention_context_buckets
 
+    def test_dsv4_long_context_buckets_bound_mtp_graph_width(self, monkeypatch):
+        monkeypatch.delenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", raising=False)
+        monkeypatch.delenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", raising=False)
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_DECODE_ONLY",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[8, 16],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=2)
+        config.speculative_config = MagicMock(num_speculative_tokens=7)
+        config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+        config.model_config.max_model_len = 262144
+        config.model_config.hf_config.index_topk = 512
+        config.model_config.hf_config.compress_ratios = [128, 4, 128]
+
+        with (
+            patch.object(current_platform, "is_cuda", return_value=True),
+            patch.object(current_platform, "is_device_capability", return_value=True),
+        ):
+            dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=8,
+        )
+
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (
+            2048,
+            4096,
+            16384,
+            65536,
+            131072,
+        )
+        expected_buckets = {
+            3000: 4096,
+            5000: 16384,
+            20000: 65536,
+            100000: 131072,
+        }
+        for context_len, expected_bucket in expected_buckets.items():
+            mode, descriptor = dispatcher.dispatch(
+                num_tokens=8,
+                uniform_decode=True,
+                attention_context_len=context_len,
+            )
+            assert mode == CUDAGraphMode.FULL
+            assert descriptor.attention_context_bucket == expected_bucket
+
+        _, unbounded = dispatcher.dispatch(
+            num_tokens=8,
+            uniform_decode=True,
+            attention_context_len=200000,
+        )
+        assert unbounded.attention_context_bucket is None
+
     def test_fp8_e5m2_decode_context_bucket_is_shape_derived_on_sm70(self, monkeypatch):
         monkeypatch.delenv("VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS", raising=False)
         comp_config = CompilationConfig(

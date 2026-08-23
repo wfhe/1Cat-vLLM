@@ -11,6 +11,7 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32,
 )
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.workspace import current_workspace_manager
 
 _INDEX_HEAD_DIM = 128
 _INDEX_CACHE_BYTES = _INDEX_HEAD_DIM + 4
@@ -54,6 +55,18 @@ _PREFILL_CUBLAS = os.getenv("VLLM_SM70_INDEXER_PREFILL_CUBLAS", "1") == "1"
 _PREFILL_TILE_MB = int(os.getenv("VLLM_SM70_INDEXER_PREFILL_TILE_MB", "192"))
 _EPILOGUE_BLOCK_K = 256
 _EPILOGUE_BLOCK_H = 8
+
+# At long context the paged Triton decode kernel rescans the same FP8 MQA keys
+# once for every verifier row and head. For the one-request DSpark shape, gather
+# the keys once and let cuBLAS score all rows/heads together. FP32 output is
+# deliberate: an FP16 score intermediate produced rare top-k set changes at
+# 16K/64K compressed tokens. Short and generic shapes retain the fused paged
+# kernel, whose launch overhead is lower there.
+_DECODE_CUBLAS = os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS", "1") == "1"
+_DECODE_CUBLAS_MIN_KEYS = int(
+    os.getenv("VLLM_SM70_INDEXER_DECODE_CUBLAS_MIN_KEYS", "1024")
+)
+_DECODE_CUBLAS_MAX_ROWS = 8
 
 
 @triton.jit
@@ -193,6 +206,71 @@ def _dequant_paged_index_k_kernel(
         dequant.to(out_ptr.type.element_ty),
         mask=valid[:, None],
     )
+
+
+@triton.jit
+def _gather_paged_index_k_unscaled_kernel(
+    cache_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    out_k_ptr,
+    out_scale_ptr,
+    cache_stride0,
+    out_k_stride0,
+    cache_block_size,
+    max_seq_len,
+    num_rows,
+    head_dim: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Gather one request's live paged keys once for all verifier rows.
+
+    ``max_seq_len`` is a CUDA-graph bucket and can be much wider than the
+    currently allocated request. Derive the live bound on device from the
+    row lengths so graph replay never dereferences a ``-1`` block-table tail.
+    Rows outside the live bound are zeroed to keep the workspace deterministic;
+    the downstream top-k still applies each row's own sequence length.
+    """
+    key_offsets = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    dim_offsets = tl.arange(0, head_dim)
+    row_offsets = tl.arange(0, MAX_ROWS)
+    row_lens = tl.load(
+        seq_lens_ptr + row_offsets,
+        mask=row_offsets < num_rows,
+        other=0,
+    )
+    live_seq_len = tl.max(row_lens, axis=0)
+    in_bucket = key_offsets < max_seq_len
+    valid = in_bucket & (key_offsets < live_seq_len)
+
+    block_in_seq = key_offsets // cache_block_size
+    pos_in_block = key_offsets % cache_block_size
+    physical_block = tl.load(
+        block_table_ptr + block_in_seq,
+        mask=valid,
+        other=0,
+    )
+    token_ptr, scale_ptr = _index_cache_ptrs(
+        cache_ptr,
+        physical_block,
+        pos_in_block,
+        cache_stride0,
+        cache_block_size,
+        head_dim,
+    )
+    packed = tl.load(
+        token_ptr[:, None] + dim_offsets[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scales = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
+    tl.store(
+        out_k_ptr + key_offsets[:, None] * out_k_stride0 + dim_offsets[None, :],
+        fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16),
+        mask=in_bucket[:, None],
+    )
+    tl.store(out_scale_ptr + key_offsets, scales, mask=in_bucket)
 
 
 @triton.jit
@@ -616,6 +694,68 @@ def sm70_indexer_prefill_logits(
     return torch.mm(weighted_q, k_fp16.t(), out_dtype=torch.float32)
 
 
+def _decode_logits_cublas(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    flat_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Score a one-request decode by sharing one paged gather across rows."""
+    total_rows, num_heads, head_dim = q.shape
+    workspace = current_workspace_manager()
+    gathered_k, k_scales, scores = workspace.get_simultaneous(
+        ((max_seq_len, head_dim), torch.float16),
+        ((max_seq_len,), torch.float32),
+        ((total_rows * num_heads, max_seq_len), torch.float32),
+    )
+    block_n = 16
+    _gather_paged_index_k_unscaled_kernel[(triton.cdiv(max_seq_len, block_n),)](
+        cache,
+        block_table,
+        flat_lens,
+        gathered_k,
+        k_scales,
+        cache.stride(0),
+        gathered_k.stride(0),
+        cache.shape[1],
+        max_seq_len,
+        total_rows,
+        head_dim=head_dim,
+        MAX_ROWS=_DECODE_CUBLAS_MAX_ROWS,
+        BLOCK_N=block_n,
+        num_warps=4,
+    )
+
+    q2 = q.reshape(total_rows * num_heads, head_dim)
+    torch.mm(
+        q2,
+        gathered_k.t(),
+        out=scores,
+        out_dtype=torch.float32,
+    )
+    out = torch.empty((total_rows, max_seq_len), dtype=torch.float32, device=q.device)
+    _relu_weight_headsum_kernel[
+        (total_rows, triton.cdiv(max_seq_len, _EPILOGUE_BLOCK_K))
+    ](
+        scores,
+        weights,
+        k_scales,
+        out,
+        scores.stride(0) * num_heads,
+        scores.stride(0),
+        weights.stride(0),
+        out.stride(0),
+        max_seq_len,
+        num_heads=num_heads,
+        BLOCK_K=_EPILOGUE_BLOCK_K,
+        BLOCK_H=_EPILOGUE_BLOCK_H,
+        num_warps=4,
+    )
+    return out
+
+
 def sm70_indexer_decode_logits(
     q: torch.Tensor,
     cache: torch.Tensor,
@@ -631,17 +771,41 @@ def sm70_indexer_decode_logits(
     # factored path collapses the head axis up front.
     weighted_q = q if _RELU_LOGITS else _combine_index_queries(q, weights)
 
-    if seq_lens.ndim == 2:
+    single_request = block_table.shape[0] == 1
+    native_rows = seq_lens.ndim == 2
+    if native_rows:
         next_n = seq_lens.shape[1]
         flat_lens = seq_lens.reshape(-1).to(torch.int32)
-        block_table = block_table.repeat_interleave(next_n, dim=0)
     else:
         flat_lens = seq_lens.reshape(-1).to(torch.int32)
     assert flat_lens.shape[0] == weighted_q.shape[0]
-    assert block_table.shape[0] == weighted_q.shape[0]
 
     max_seq_len = max(1, int(max_seq_len))
     total_rows = weighted_q.shape[0]
+
+    if (
+        _RELU_LOGITS
+        and _DECODE_CUBLAS
+        and max_seq_len >= _DECODE_CUBLAS_MIN_KEYS
+        and single_request
+        and 0 < total_rows <= _DECODE_CUBLAS_MAX_ROWS
+        and q.shape[1] % _EPILOGUE_BLOCK_H == 0
+        and q.is_contiguous()
+        and weights.is_contiguous()
+        and block_table.is_contiguous()
+    ):
+        return _decode_logits_cublas(
+            q,
+            cache,
+            weights,
+            flat_lens,
+            block_table,
+            max_seq_len,
+        )
+
+    if native_rows:
+        block_table = block_table.repeat_interleave(next_n, dim=0)
+    assert block_table.shape[0] == weighted_q.shape[0]
 
     if _RELU_LOGITS:
         out = torch.empty(

@@ -71,17 +71,27 @@ def _get_sm70_dsv4_decode_context_buckets(
     if not positive_ratios:
         return ()
 
-    bucket = topk_tokens * min(positive_ratios)
-    if bucket <= 0 or model_config.max_model_len <= bucket:
+    short_bucket = topk_tokens * min(positive_ratios)
+    if short_bucket <= 0 or model_config.max_model_len <= short_bucket:
         return ()
+    # Keep the graph width close enough to the live context that the C4
+    # indexer does not score the model's entire maximum length immediately
+    # after crossing the short-context bypass. The sparse progression limits
+    # startup graph count while covering the first long-indexer bucket and the
+    # 16K/64K/128K service points used by the long-context quality gates.
+    bucket_multipliers = (1, 2, 8, 32, 64)
+    buckets = tuple(
+        short_bucket * multiplier
+        for multiplier in bucket_multipliers
+        if short_bucket * multiplier < model_config.max_model_len
+    )
     logger.info_once(
-        "Auto-enabling the SM70 DeepSeek V4 short-context decode CUDA graph "
-        "at %d tokens. Set %s explicitly to override or to an empty value "
-        "to disable.",
-        bucket,
+        "Auto-enabling SM70 DeepSeek V4 decode CUDA graph context buckets "
+        "%s. Set %s explicitly to override or to an empty value to disable.",
+        buckets,
         env_name,
     )
-    return (bucket,)
+    return buckets
 
 
 def _is_sm70_fp8_kv_decode_shape(

@@ -1,0 +1,146 @@
+# SM70 DeepSeek V4 DSpark Verifier and Long-Context Ledger
+
+This ledger tracks the 2026-08-24 TP8/V100 campaign for
+`/data/models/DeepSeek-V4-Flash-0731`. It complements the historical N7 ledger
+and prevents short route-hit smokes from being reused as verifier, long-context,
+or quality evidence.
+
+## Acceptance Contract
+
+- Eight V100 GPUs, TP8, one request, DeepSeek V4 Flash DSpark with seven draft
+  tokens, temperature 1.0, top-p 1.0, and the production strict rejection
+  sampler.
+- Primary speed gate: at least 100 pure decode token/s on the pinned 120-token
+  Chinese HTML prompt with 3,500 generated tokens. TTFT and prefill are reported
+  separately.
+- Primary latency gate: complete verifier at most 20 ms per speculative round.
+  Complete verifier means target forward, target logits, and strict
+  rejection/sampling. Draft work, accepted-state commit, CPU scheduling, and
+  total round wall are reported separately rather than hidden in that number.
+- Long-context gate: report raw contexts 1K, 4K, 16K, 64K, 128K, and 252K with
+  identical output length and sampling. Report verifier/round cost, acceptance
+  by position, emitted tokens/round, and pure decode separately.
+- Quality gate: compare no-speculation and DSpark on deterministic GSM8K,
+  HumanEval, a multilingual/multitask LongBench subset, and 128K/252K needle
+  retrieval. A speed result cannot promote a route that loses the paired quality
+  or output-health gates.
+- Shared-machine rule: launch only after an event-driven free-GPU gate, never
+  stop unrelated owners, avoid frequent polling, and terminate every task-owned
+  worker after the artifact is complete.
+
+## Reproduced Baselines
+
+Current latest-main source plus the admitted SM70 route repairs reproduces the
+historical endpoint target. Three 3,500-token runs measured 118.481, 115.975,
+and 116.288 token/s; median throughput is 116.288 token/s. The third run
+accepted 2,816 of 4,781 proposed draft tokens (0.589), emitted 5.123 tokens per
+round, and had per-position unconditional acceptance
+`0.8873/0.7818/0.6911/0.6047/0.5066/0.3880/0.2635`.
+
+The matched no-speculation route measured 66.014 token/s and 15.1483 ms/token
+at 1,024 input plus 256 output tokens. A synchronized DSpark profile measured:
+
+| Component | Steady median per round |
+|---|---:|
+| Target forward, M=8 | 34.295 ms |
+| Target logits | 0.326 ms |
+| Strict rejection/sample | 0.499 ms |
+| Complete verifier | 35.120 ms |
+| Draft GPU work | 4.419 ms |
+| Total round wall | 43.505 ms |
+
+The 20 ms goal therefore requires target-forward work, not sampler-only tuning.
+
+## Admitted Source Gates
+
+The following changes have passed focused current-source gates but still require
+their stated end-to-end promotion gate:
+
+1. FP32 mHC staging now covers verifier rows M=1..8. M=8 falls from 0.05383 to
+   0.01257 ms per call and projects 3.507 ms saved across 85 calls. Four V100
+   numerical cases were bitwise exact.
+2. The M=8 graph derives a bounded 2,048-token short-context bucket instead of
+   reserving the whole maximum context. CPU dispatcher tests pass; synchronized
+   TP8 transfer remains required.
+3. Single-request SM70 compressor C4/C128 intermediates use bounded private
+   device rings when prefix caching, pipeline parallelism, KV transfer, and
+   parallel drafting are absent. Seven V100 ring/workspace tests and eleven CPU
+   route tests pass. This removes paged intermediate growth without changing the
+   sparse attention/index cache.
+4. The long-context C4 indexer gathers paged FP8 keys once and uses FP32 cuBLAS
+   scores for all M=8 rows and 64 heads. It retains per-head ReLU and FP8 scale
+   semantics. The captured-graph test, shorter dynamic replay, graph-tail mask,
+   and workspace-width gate pass on V100.
+
+The indexer crossover gate uses FP32 scores, signed head weights, top-k 512,
+M=8, H=64, D=128, and CUDA Graph replay:
+
+| Compressed keys | Fused paged Triton | Gather + FP32 cuBLAS | 21-layer projection |
+|---:|---:|---:|---:|
+| 1,024 | 0.06854 ms | 0.02096 ms | -0.999 ms |
+| 2,048 | 0.13455 ms | 0.02519 ms | -2.297 ms |
+| 4,096 | 0.23433 ms | 0.04738 ms | -3.926 ms |
+| 8,192 | 0.45660 ms | 0.07680 ms | -7.976 ms |
+| 16,384 | 0.85016 ms | 0.14493 ms | -14.810 ms |
+
+All 40 rows retained the exact top-k set; maximum logit absolute difference was
+`1.221e-4`. The default crossover is 1,024 compressed keys. Generic batches,
+noncontiguous inputs, more than eight rows, and non-ReLU semantics retain the
+existing fused paged kernel.
+
+SM70 DeepSeek V4 graph context buckets now follow raw widths 2K, 4K, 16K, 64K,
+and 128K when the model maximum is 256K. Longer requests retain the generic
+full-context graph. An explicit `VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS`, or an
+explicit MTP bucket override including an empty value, remains authoritative.
+
+## Long-Context Diagnosis
+
+DeepSeek V4 does not use the repository's classic Flash-V100 dense-attention
+decode route. Its production log identifies packed-FP8 SM70 sparse MLA with C4,
+C128, SWA-128, and top-k 512. Sparse attention after selection is nearly fixed
+work; the C4 indexer scan grows with compressed history and was the expected
+linear decay source. The private compressor rings address capacity and memory
+growth, while gather-once FP32 cuBLAS addresses the repeated index scan.
+
+`benchmarks/benchmark_dsv4_dspark_long_context.py` records each completed
+context incrementally. It uses server-reported prompt usage, separates TTFT
+from pure decode, snapshots speculative counters around each request, and gates
+suffix-marker retrieval, replacement characters, token diversity, and repeated
+token runs.
+
+## Quality Gate
+
+`benchmarks/benchmark_dsv4_quality_api.py` provides deterministic HumanEval and
+LongBench-subset API gates. HumanEval code executes with Landlock filesystem
+isolation, seccomp network/process restrictions, a private temporary directory,
+and CPU, address-space, output-file, and process limits. The sandbox has proven
+that normal Python works while `/home`, `/data`, global `/tmp`, networking,
+forking, and signalling other processes are denied.
+
+The first paired LongBench subset is `hotpotqa`, `multifieldqa_zh`,
+`gov_report`, and `lcc`. Official LongBench metrics are loaded from the pinned
+local checkout; `jieba==0.42.1`, `rouge==1.0.1`, and `fuzzywuzzy==0.18.0` are
+isolated under `/data/models/dsv4-quality-deps` rather than installed into the
+shared runtime environment.
+
+## Rejected or Deferred Paths
+
+- A TP8 M=8 64 KiB hierarchical all-reduce was slower than NCCL in isolation
+  and saved only 0.028 ms across 87 joined calls, within noise. It was fully
+  reverted and must not be repeated without a different communication design.
+- The expert-row grouped MXFP4 candidate is tracked separately. Its bitwise
+  microbenchmarks justify a full TP8 trial but not promotion by themselves.
+- Disabling per-head ReLU, changing index-cache layout, reducing index top-k,
+  or weakening strict rejection are outside the quality contract.
+
+## Artifact Roots
+
+- 100+ endpoint: `/data/models/v100-dsv4-0731-tp8-dspark-prob-n7-latest-c4-20260824-r6`
+- no-speculation: `/data/models/v100-dsv4-0731-tp8-nospec-latest-c4-20260824-r1`
+- synchronized breakdown: `/data/models/v100-dsv4-0731-tp8-dspark-prob-n7-profile-latest-c4-20260824-r1`
+- mHC source gate: `/data/models/dsv4-verifier-20ms-mhc-source-gate-r2-cuda128`
+- private rings: `/data/models/dsv4-verifier-20ms-private-ring-source-gate-r1`
+- indexer crossover: `/data/models/dsv4-verifier-20ms-indexer-crossover-r3`
+- indexer source gate: `/data/models/dsv4-verifier-20ms-indexer-source-gate-r1`
+- rejected TP8 all-reduce: `/data/models/dsv4-verifier-20ms-tp8-ar-screen-r1`
+

@@ -41737,3 +41737,17 @@ Interpretation:
   `results/tp4_gpu0123_mtp4_fp8kv_sharegpt16_seed20260822_all_jit_warmup_reserved_graph.json`.
   These results are the accepted 35B evidence; earlier short route-hit and
   quality smokes must not be substituted for the matched speed contract.
+
+## 2026-08-24 DeepSeek V4 DSpark verifier and long-context campaign
+
+- The active TP8/V100 campaign, exact baseline contracts, admitted focused
+  gates, rejected paths, long-context sweep, and paired quality requirements
+  are recorded in
+  `docs/design/sm70_deepseek_v4_dspark_verifier_20ms_long_context.md`.
+- Latest-main DSpark has reproduced a 116.288 token/s median on the historical
+  3,500-token endpoint contract. The current complete verifier is 35.120 ms per
+  round; the active target is at most 20 ms without acceptance or dataset loss.
+- Do not cite indexer, mHC, compressor-ring, or MoE microbenchmarks as the final
+  verifier result. Promotion requires a synchronized TP8 full-model profile,
+  long-context 1K-252K evidence, paired no-speculation quality, and task-owned
+  GPU cleanup.
