@@ -68,6 +68,8 @@ class DFlash2GDNGroupDescriptor:
     block_table_ptrs: torch.Tensor
     state_output_ptrs: torch.Tensor
     block_table_strides: torch.Tensor
+    prepared_key: tuple[int, int, int, int] | None = None
+    prepared_metadata: dict[int, "GDNAttentionMetadata"] | None = None
 
 
 _GDN_DDTREE_FAST_COMMON_BUFFERS: dict[
@@ -2285,6 +2287,12 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(table.data_ptr() for table in input_tables),
         tuple(state.data_ptr() for state in output_states),
         tuple(table.stride(0) for table in input_tables),
+        common_buffers.spec_sequence_masks.data_ptr(),
+        common_buffers.spec_token_indx.data_ptr(),
+        common_buffers.non_spec_token_indx.data_ptr(),
+        common_buffers.spec_query_start_loc.data_ptr(),
+        common_buffers.num_accepted_tokens.data_ptr(),
+        common_buffers.spec_state_slot_selectors.data_ptr(),
     )
     if descriptor is None or descriptor.key != descriptor_key:
         descriptor = DFlash2GDNGroupDescriptor(
@@ -2333,38 +2341,52 @@ def prepare_dflash2_gdn_group_metadata(
         width,
     )
 
-    prepared: dict[int, GDNAttentionMetadata] = {}
-    for builder_id, state_output in zip(builder_ids, output_states):
-        prepared[builder_id] = GDNAttentionMetadata(
-            num_prefills=0,
-            num_prefill_tokens=0,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_spec_decodes=num_spec_decodes,
-            num_spec_decode_tokens=common_gdn_metadata.num_spec_decode_tokens,
-            num_actual_tokens=num_actual_tokens,
-            has_initial_state=None,
-            chunk_indices=None,
-            chunk_offsets=None,
-            spec_query_start_loc=common_buffers.spec_query_start_loc[
-                : num_actual_tokens + 1
-            ],
-            non_spec_query_start_loc=None,
-            spec_state_indices_tensor=state_output[:num_actual_tokens],
-            non_spec_state_indices_tensor=None,
-            spec_sequence_masks=common_buffers.spec_sequence_masks[:num_actual_tokens],
-            spec_token_indx=common_buffers.spec_token_indx[:spec_token_size],
-            non_spec_token_indx=common_buffers.non_spec_token_indx[:0],
-            num_accepted_tokens=common_buffers.num_accepted_tokens[:num_actual_tokens],
-            spec_state_slot_selectors=common_buffers.spec_state_slot_selectors[
-                :num_actual_tokens
-            ],
-            ddtree_parent_ids=None,
-            ddtree_num_tree_tokens_cpu=None,
-            nums_dict=None,
-            batch_ptr=None,
-            token_chunk_offset_ptr=None,
-        )
+    prepared_key = (
+        num_spec_decodes,
+        num_actual_tokens,
+        common_gdn_metadata.num_spec_decode_tokens,
+        spec_token_size,
+    )
+    prepared = descriptor.prepared_metadata
+    if descriptor.prepared_key != prepared_key or prepared is None:
+        prepared = {}
+        for builder_id, state_output in zip(builder_ids, output_states):
+            prepared[builder_id] = GDNAttentionMetadata(
+                num_prefills=0,
+                num_prefill_tokens=0,
+                num_decodes=0,
+                num_decode_tokens=0,
+                num_spec_decodes=num_spec_decodes,
+                num_spec_decode_tokens=common_gdn_metadata.num_spec_decode_tokens,
+                num_actual_tokens=num_actual_tokens,
+                has_initial_state=None,
+                chunk_indices=None,
+                chunk_offsets=None,
+                spec_query_start_loc=common_buffers.spec_query_start_loc[
+                    : num_actual_tokens + 1
+                ],
+                non_spec_query_start_loc=None,
+                spec_state_indices_tensor=state_output[:num_actual_tokens],
+                non_spec_state_indices_tensor=None,
+                spec_sequence_masks=common_buffers.spec_sequence_masks[
+                    :num_actual_tokens
+                ],
+                spec_token_indx=common_buffers.spec_token_indx[:spec_token_size],
+                non_spec_token_indx=common_buffers.non_spec_token_indx[:0],
+                num_accepted_tokens=common_buffers.num_accepted_tokens[
+                    :num_actual_tokens
+                ],
+                spec_state_slot_selectors=common_buffers.spec_state_slot_selectors[
+                    :num_actual_tokens
+                ],
+                ddtree_parent_ids=None,
+                ddtree_num_tree_tokens_cpu=None,
+                nums_dict=None,
+                batch_ptr=None,
+                token_chunk_offset_ptr=None,
+            )
+        descriptor.prepared_key = prepared_key
+        descriptor.prepared_metadata = prepared
 
     if envs.VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW:
         spec_mask = common_gdn_metadata.spec_sequence_masks

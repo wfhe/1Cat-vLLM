@@ -496,6 +496,18 @@ Goal:
   microbenchmark results, not yet an endpoint round-cost claim. The benchmark
   is `benchmarks/benchmark_sm70_dflash2_gdn_metadata.py`; an unprofiled TP4
   fixed-trajectory run remains required before default enablement.
+- The persistent descriptor now also caches only the shape-specific
+  `GDNAttentionMetadata` views. Their backing state IDs, accepted counts,
+  selectors, masks, and query offsets are still overwritten by the fused
+  kernel on every replay. A poison-and-replay test proves that a same-shape
+  call reuses the view objects while observing new tensor contents, and a B2
+  to B1 transition proves that a shape change rebuilds the views. On the same
+  B1/ten-group/block-eight microbenchmark, the cached fused path is 0.131 ms
+  synchronized-wall p50 versus 0.383 ms before view caching; the remaining
+  Python delta over the 0.053 ms raw-kernel wall is about 0.078 ms. Reinstating
+  the production scalar host fence costs only 0.028 ms p50, so it is not the
+  source of the former multi-millisecond Draft-to-Target gap and remains in
+  place pending the end-to-end trajectory gate.
 
 Main implementation priority:
 

@@ -247,6 +247,14 @@ def _run_case(
             num_warps=1,
         )
 
+    def fused_with_host_fence_step() -> None:
+        fused_step()
+        if (
+            common_metadata.spec_query_start_loc[-1].item()
+            != common_metadata.num_spec_decode_tokens
+        ):
+            raise AssertionError("invalid speculative query span")
+
     legacy_step()
     torch.cuda.synchronize()
     expected_states = [
@@ -291,9 +299,13 @@ def _run_case(
 
     legacy_launches = _profile_cuda_launches(legacy_step)
     fused_launches = _profile_cuda_launches(fused_step)
+    fused_with_host_fence_launches = _profile_cuda_launches(
+        fused_with_host_fence_step
+    )
     fused_kernel_only_launches = _profile_cuda_launches(fused_kernel_only_step)
     legacy = _measure(legacy_step, repeats)
     fused = _measure(fused_step, repeats)
+    fused_with_host_fence = _measure(fused_with_host_fence_step, repeats)
     fused_kernel_only = _measure(fused_kernel_only_step, repeats)
     return {
         "batch_size": batch_size,
@@ -303,10 +315,16 @@ def _run_case(
         "correctness": "bitwise_equal_after_poison",
         "legacy_cuda_launches": legacy_launches,
         "fused_cuda_launches": fused_launches,
+        "fused_with_host_fence_cuda_launches": fused_with_host_fence_launches,
         "fused_kernel_only_cuda_launches": fused_kernel_only_launches,
         "legacy": legacy,
         "fused": fused,
+        "fused_with_host_fence": fused_with_host_fence,
         "fused_kernel_only": fused_kernel_only,
+        "host_fence_wall_cost_p50_ms": (
+            fused_with_host_fence["synchronized_wall_ms"]["p50"]
+            - fused["synchronized_wall_ms"]["p50"]
+        ),
         "fused_python_overhead_p50_ms": (
             fused["synchronized_wall_ms"]["p50"]
             - fused_kernel_only["synchronized_wall_ms"]["p50"]

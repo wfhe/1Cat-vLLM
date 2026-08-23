@@ -653,6 +653,7 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     assert second_result is not None
     replayed, replay_descriptor = second_result
     assert replay_descriptor is descriptor
+    assert replayed is prepared
     torch.cuda.synchronize(device)
     for group_id, builder in enumerate(builders):
         state = replayed[id(builder)].spec_state_indices_tensor
@@ -663,6 +664,38 @@ def test_dflash2_fused_gdn_group_metadata_replay(
         )
     assert replayed[id(builders[0])].num_accepted_tokens is not None
     assert replayed[id(builders[0])].num_accepted_tokens.tolist() == [7, 2] + [1] * 14
+
+    # The pointer tables remain valid when the graph batch shape changes, but
+    # the graph-buffer views do not. Ensure the cache key rebuilds their
+    # lengths instead of returning the steady-state B2 metadata.
+    single_common = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([7], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32, device=device),
+        query_start_loc_cpu=torch.tensor([0, 8], dtype=torch.int32),
+        num_spec_state_tokens=7,
+        legacy_mixed_decode_routing=False,
+    )
+    assert single_common is not None
+    single_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=(block_tables[0][:1], block_tables[1][:1]),
+        common_gdn_metadata=single_common,
+        num_accepted_tokens=accepted[:1],
+        num_actual_tokens=8,
+        descriptor=descriptor,
+    )
+    assert single_result is not None
+    single_prepared, single_descriptor = single_result
+    assert single_descriptor is descriptor
+    assert single_prepared is not replayed
+    torch.cuda.synchronize(device)
+    single = single_prepared[id(builders[0])]
+    assert single.spec_state_indices_tensor is not None
+    assert single.spec_state_indices_tensor.shape == (8, 8)
+    assert single.spec_query_start_loc is not None
+    assert single.spec_query_start_loc.tolist() == [0, 8] + [8] * 7
+    assert single.num_accepted_tokens is not None
+    assert single.num_accepted_tokens.tolist() == [7] + [1] * 7
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
