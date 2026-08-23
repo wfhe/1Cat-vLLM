@@ -508,6 +508,57 @@ Goal:
   the production scalar host fence costs only 0.028 ms p50, so it is not the
   source of the former multi-millisecond Draft-to-Target gap and remains in
   place pending the end-to-end trajectory gate.
+- The first matched TP4 endpoint trace now validates that the microbenchmark
+  saving survives the real MRV2 DFlash2 path. Both runs use source
+  `11a190397abd7209ed1d3aeeeb8ed691e06087f7`, the same fixed shuffled GSM8K
+  request, Graph target and draft, block eight, probabilistic sampling, target
+  E5M2 KV, and draft FP16 KV. The control omitted the parent fast-path gate and
+  therefore exercised the generic metadata builder; the candidate enabled both
+  `VLLM_SM70_DFLASH2_VERIFY_FASTPATH=1` and
+  `VLLM_SM70_DFLASH2_FUSED_GDN_METADATA=1`.
+    - Control: 4.820868 s decode / 103 verification rounds = 46.8045 ms per
+      round, 88.99 steady-decode tok/s, and 86.11 aggregate tok/s.
+    - Fused candidate: 3.573145 s / 102 rounds = 35.0308 ms per round, 120.06
+      steady-decode tok/s, and 114.20 aggregate tok/s.
+    - This is an 11.7737 ms (`25.15%`) reduction in traced endpoint round cost,
+      `+34.92%` steady-decode throughput, and `+32.61%` aggregate throughput.
+      The 430 output token IDs and SHA256
+      `c3aa4bdf534d580213871cb17d31ee997db9cf2ae19ae4766646fe92d463a225`
+      are exactly equal and the answer remains correct. Acceptance length does
+      not regress: it moves from 4.1748 to 4.2157 (`+0.0409`).
+    - The candidate trace contains 412 fused metadata launches across TP4,
+      corresponding to 103 captured steps per rank (the request reports 102
+      draft/verification rounds). Generic CUB `DeviceReduce` and `DeviceSelect`
+      disappear (`20,800 -> 0` each); `DeviceScan` falls from 20,008 to 19,816,
+      leaving scans owned by other paths. CUDA runtime fan-out falls from
+      27,060 to 2,492 stream synchronizations, 90,524 to 16,328 async copies,
+      and 205,752 to 88,928 ordinary kernel launches across the four workers.
+      This proves that the wall saving is primarily removal of the repeated
+      host-synchronized metadata fan-out rather than the fused kernel's own
+      1.528 ms aggregate GPU service.
+    - These endpoint values were collected under low-overhead Graph-level
+      Nsight tracing and are the accepted matched A/B for this leaf. A short
+      node-level trace is still required to update the semantic Draft-to-Target
+      and target-verifier phase table; node tracing will be used for
+      composition only because it inflates absolute latency.
+  Artifacts are
+  `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/results/dflash2-fused-viewcache-b1-graph-o512-{v2,v4}.json` and
+  `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/profiles/latest-e2e/dflash2-fused-viewcache-b1-graph-v4.{qdstrm,nsys-rep,sqlite}`.
+- `dnv2003/v100-skinny` is useful as an optimization inventory, but its published
+  219.1 tok/s result is a Qwen3.8 mixed-NVFP4/FP8 MTP-k7 route on its 1Cat-vLLM
+  1.2.2 fork, not a DFlash2 result and therefore not a direct baseline. Its
+  chain-MTP GDN builder removes 21 device synchronizations and about 70 copies
+  for a reported 1.4 ms/step saving; PR257's persistent pointer table is the
+  stronger version of the same principle and now has direct DFlash2 evidence.
+  The fork's lagged CUDA-event/NVTX phase profiler is worth adapting to MRV2 so
+  verify, rejection, and proposal can be measured without adding a per-round
+  synchronization. Its partition pin is not active leverage at this run's
+  `max_model_len=8192`, and its FP16-KV win is specific to a route where FP8 KV
+  fell back to a scalar path; Flash-V100 reports the optimized E5M2 cache path
+  here, so any KV change still requires a matched A/B. The QPN8 verifier idea is
+  relevant, but the independently adapted block-FP8 implementation in Draft PR
+  #258 currently rejects speculative configurations. It must pass a dedicated
+  DFlash2 M=8 contract and quality gate before stacking onto this PR.
 
 Main implementation priority:
 
