@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.llm_base_proposer import (
     SpecDecodeBaseProposer,
+    _sm70_mtp_hotpath_warmup_batch_sizes,
     _sm70_mtp_moe_warmup_sizes,
 )
 
@@ -40,6 +41,12 @@ def test_sm70_mtp_moe_warmup_sizes():
     assert _sm70_mtp_moe_warmup_sizes(256, 8, 8192) == (9, 33, 257)
     assert _sm70_mtp_moe_warmup_sizes(256, 8, 32) == (9,)
     assert _sm70_mtp_moe_warmup_sizes(0, 8, 8192) == ()
+
+
+def test_sm70_mtp_hotpath_warmup_batch_sizes():
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(1) == (1,)
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(4) == (1, 4)
+    assert _sm70_mtp_hotpath_warmup_batch_sizes(64) == (1, 4)
 
 
 def test_sm70_mtp_moe_warmup_runs_each_shape_once():

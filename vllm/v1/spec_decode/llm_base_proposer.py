@@ -114,6 +114,12 @@ def _sm70_mtp_moe_warmup_sizes(
     return tuple(sorted(size for size in sizes if size <= max_num_tokens))
 
 
+def _sm70_mtp_hotpath_warmup_batch_sizes(max_batch_size: int) -> tuple[int, ...]:
+    """Cover Triton's single-request and concurrent scalar specializations."""
+    concurrent_batch_size = max(1, min(int(max_batch_size), 4))
+    return tuple(sorted({1, concurrent_batch_size}))
+
+
 def _is_dflash_method(method: str | None) -> bool:
     return method in ("dflash", "dflash_ddtree", "dspark")
 
@@ -862,6 +868,122 @@ class SpecDecodeBaseProposer:
             summary,
         )
 
+    def _warmup_sm70_mtp_hotpath_batch(self, batch_size: int, vocab_size: int) -> None:
+        valid_sampled_tokens_count = None
+        for num_sampled_tokens in sorted({1, self.num_speculative_tokens + 1}):
+            sampled_token_ids = torch.zeros(
+                (batch_size, num_sampled_tokens),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            discard_request_mask = torch.zeros(
+                batch_size, dtype=torch.bool, device=self.device
+            )
+            backup_next_token_ids = torch.zeros(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            next_token_ids = torch.empty(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            next_valid_count = torch.empty_like(next_token_ids)
+            eagle_prepare_next_token_padded_kernel[(batch_size,)](
+                sampled_token_ids,
+                discard_request_mask,
+                backup_next_token_ids,
+                next_token_ids,
+                next_valid_count,
+                vocab_size,
+                num_sampled_tokens,
+                batch_size,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=next_power_of_2(num_sampled_tokens),
+            )
+            if num_sampled_tokens == self.num_speculative_tokens + 1:
+                valid_sampled_tokens_count = next_valid_count
+        assert valid_sampled_tokens_count is not None
+
+        next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=self.device)
+        cu_num_draft_tokens = (
+            torch.arange(
+                1,
+                batch_size + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            * self.num_speculative_tokens
+        )
+        query_start_loc = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=self.device
+        )
+        token_indices_to_sample = torch.empty_like(next_token_ids)
+        num_rejected_tokens_gpu = torch.empty_like(next_token_ids)
+        eagle_prepare_inputs_padded_kernel[(batch_size,)](
+            cu_num_draft_tokens,
+            valid_sampled_tokens_count,
+            query_start_loc,
+            token_indices_to_sample,
+            num_rejected_tokens_gpu,
+            batch_size,
+        )
+
+        for dtype, replace_from, replace_to in (
+            (torch.float32, 0, 1),  # temperature
+            (torch.float32, 0, 0),  # top_p
+            (torch.int32, 0, 0),  # top_k
+        ):
+            rejection_expand_input = torch.ones(
+                batch_size, dtype=dtype, device=self.device
+            )
+            rejection_expand_output = torch.empty(
+                batch_size * self.num_speculative_tokens,
+                dtype=dtype,
+                device=self.device,
+            )
+            rejection_expand_kernel[(batch_size,)](
+                rejection_expand_output,
+                rejection_expand_input,
+                cu_num_draft_tokens,
+                replace_from,
+                replace_to,
+                MAX_NUM_TOKENS=MAX_SPEC_LEN,
+            )
+
+        n_blocks_per_req = max(
+            1, (self.max_model_len + self.block_size - 1) // self.block_size
+        )
+        positions = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
+        block_table = torch.zeros(
+            (batch_size, n_blocks_per_req),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        seq_lens = torch.ones(batch_size, dtype=torch.int32, device=self.device)
+        out_positions = torch.empty_like(positions)
+        out_slot_mapping = torch.empty(
+            batch_size, dtype=torch.int64, device=self.device
+        )
+        eagle_step_update_slot_mapping_and_metadata(
+            positions_1d=positions,
+            block_table_tensor=block_table,
+            seq_lens=seq_lens,
+            block_size=self.block_size,
+            max_model_len=self.max_model_len,
+            out_clamped_positions=out_positions,
+            out_slot_mapping=out_slot_mapping,
+            input_batch_size=batch_size,
+        )
+
+        draft_logits = torch.zeros(
+            (batch_size, vocab_size), dtype=torch.float32, device=self.device
+        )
+        draft_top_k = torch.full(
+            (batch_size,),
+            min(20, vocab_size),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        apply_top_k_top_p(draft_logits, draft_top_k, None)
+
     def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
         """Warm MTP helper kernels that otherwise JIT on the first request."""
         if (
@@ -877,115 +999,9 @@ class SpecDecodeBaseProposer:
             return ()
 
         try:
-            batch_size = max(1, min(self.max_batch_size, 4))
             vocab_size = max(2, self.draft_model_config.get_vocab_size())
-
-            valid_sampled_tokens_count = None
-            for num_sampled_tokens in sorted({1, self.num_speculative_tokens + 1}):
-                sampled_token_ids = torch.zeros(
-                    (batch_size, num_sampled_tokens),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                discard_request_mask = torch.zeros(
-                    batch_size, dtype=torch.bool, device=self.device
-                )
-                backup_next_token_ids = torch.zeros(
-                    batch_size, dtype=torch.int32, device=self.device
-                )
-                next_token_ids = torch.empty(
-                    batch_size, dtype=torch.int32, device=self.device
-                )
-                next_valid_count = torch.empty_like(next_token_ids)
-                eagle_prepare_next_token_padded_kernel[(batch_size,)](
-                    sampled_token_ids,
-                    discard_request_mask,
-                    backup_next_token_ids,
-                    next_token_ids,
-                    next_valid_count,
-                    vocab_size,
-                    num_sampled_tokens,
-                    batch_size,
-                    sampled_token_ids.stride(0),
-                    BLOCK_SIZE_TOKENS=next_power_of_2(num_sampled_tokens),
-                )
-                if num_sampled_tokens == self.num_speculative_tokens + 1:
-                    valid_sampled_tokens_count = next_valid_count
-            assert valid_sampled_tokens_count is not None
-
-            next_token_ids = torch.empty(
-                batch_size, dtype=torch.int32, device=self.device
-            )
-
-            cu_num_draft_tokens = (
-                torch.arange(
-                    1,
-                    batch_size + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                * self.num_speculative_tokens
-            )
-            query_start_loc = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=self.device
-            )
-            token_indices_to_sample = torch.empty_like(next_token_ids)
-            num_rejected_tokens_gpu = torch.empty_like(next_token_ids)
-            eagle_prepare_inputs_padded_kernel[(batch_size,)](
-                cu_num_draft_tokens,
-                valid_sampled_tokens_count,
-                query_start_loc,
-                token_indices_to_sample,
-                num_rejected_tokens_gpu,
-                batch_size,
-            )
-
-            for dtype, replace_from, replace_to in (
-                (torch.float32, 0, 1),  # temperature
-                (torch.float32, 0, 0),  # top_p
-                (torch.int32, 0, 0),  # top_k
-            ):
-                rejection_expand_input = torch.ones(
-                    batch_size, dtype=dtype, device=self.device
-                )
-                rejection_expand_output = torch.empty(
-                    batch_size * self.num_speculative_tokens,
-                    dtype=dtype,
-                    device=self.device,
-                )
-                rejection_expand_kernel[(batch_size,)](
-                    rejection_expand_output,
-                    rejection_expand_input,
-                    cu_num_draft_tokens,
-                    replace_from,
-                    replace_to,
-                    MAX_NUM_TOKENS=MAX_SPEC_LEN,
-                )
-
-            n_blocks_per_req = max(
-                1, (self.max_model_len + self.block_size - 1) // self.block_size
-            )
-            positions = torch.zeros(batch_size, dtype=torch.int64, device=self.device)
-            block_table = torch.zeros(
-                (batch_size, n_blocks_per_req),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens = torch.ones(batch_size, dtype=torch.int32, device=self.device)
-            out_positions = torch.empty_like(positions)
-            out_slot_mapping = torch.empty(
-                batch_size, dtype=torch.int64, device=self.device
-            )
-            eagle_step_update_slot_mapping_and_metadata(
-                positions_1d=positions,
-                block_table_tensor=block_table,
-                seq_lens=seq_lens,
-                block_size=self.block_size,
-                max_model_len=self.max_model_len,
-                out_clamped_positions=out_positions,
-                out_slot_mapping=out_slot_mapping,
-                input_batch_size=batch_size,
-            )
+            for batch_size in _sm70_mtp_hotpath_warmup_batch_sizes(self.max_batch_size):
+                self._warmup_sm70_mtp_hotpath_batch(batch_size, vocab_size)
             torch.accelerator.synchronize()
         except Exception as err:  # pragma: no cover - best-effort warmup
             logger.warning_once("SM70 MTP hotpath warmup skipped: %s", err)
@@ -996,6 +1012,7 @@ class SpecDecodeBaseProposer:
             "mtp_prepare_inputs",
             "mtp_rejection_expand",
             "mtp_step_slot_mapping",
+            "mtp_draft_topk",
         )
 
     def warmup_sm70_mtp_moe_kernels(self) -> tuple[str, ...]:
