@@ -391,7 +391,10 @@ def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
 
 
 def _dflash_ddtree_target_forward_profiler_step() -> int:
-    raw = os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP", "0")
+    raw = os.getenv(
+        "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP",
+        os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP", "0"),
+    )
     try:
         return max(0, int(raw))
     except ValueError:
@@ -1141,13 +1144,19 @@ class GPUModelRunner(
         if (
             not use_spec_decode
             or self.speculative_config is None
-            or not self.speculative_config.use_dflash_ddtree()
+            or not (
+                self.speculative_config.use_dflash_ddtree()
+                or self.speculative_config.use_dspark()
+            )
             or self.device.type != "cuda"
         ):
             yield
             return
 
-        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled()
+        nvtx_enabled = bool(
+            _dflash_ddtree_target_forward_nvtx_enabled()
+            or os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_NVTX", "0") == "1"
+        )
         profiler_step = _dflash_ddtree_target_forward_profiler_step()
         if not nvtx_enabled and profiler_step <= 0:
             yield
@@ -1155,9 +1164,13 @@ class GPUModelRunner(
 
         step = getattr(self, "_dflash_ddtree_target_forward_profile_step", 0) + 1
         self._dflash_ddtree_target_forward_profile_step = step
-        label = (
+        label_prefix = (
             "ddtree_target_forward"
-            f":step={step}:tokens={num_tokens}:reqs={num_reqs}"
+            if self.speculative_config.use_dflash_ddtree()
+            else "dspark_target_forward"
+        )
+        label = (
+            f"{label_prefix}:step={step}:tokens={num_tokens}:reqs={num_reqs}"
             f":mode={cudagraph_mode.name}:pid={os.getpid()}"
         )
         profile_this_step = profiler_step > 0 and step == profiler_step
