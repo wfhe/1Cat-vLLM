@@ -91,4 +91,113 @@ unrelated process.
 
 ## Results
 
-Pending.
+### Accepted target-graph reduction
+
+The matched TP4 node trace at source `500130882ba68fb7bac3a0b9e4eb5872647fb045`
+uses the same model, draft, request, sampling, KV dtypes, and graph policy as the
+frozen baseline:
+
+- SQLite:
+  `/data/minimax-h3/task-cache/v100-dflash2-target-graph-20ms/profiles/dflash2-fused-gdn-norm-split-gemma-dynamic-b1-nodes-o128-gpu0123-v3.sqlite`.
+- Result JSON:
+  `/data/minimax-h3/task-cache/v100-dflash2-target-graph-20ms/results/dflash2-fused-gdn-norm-split-gemma-dynamic-b1-nodes-o128-gpu0123-v3.json`.
+- Four-rank synchronized target graph, with the first and last rounds removed:
+  **19.317 ms mean, 19.322 ms p50, 19.444 ms p90, 19.477 ms p99**, and
+  **1,257 nodes/rank**.
+- Rank-average kernel service is 18.552 ms, or 96.04% of the critical span.
+- Relative to the frozen 24.740 ms / 2,612-node baseline this removes
+  **5.423 ms (21.92%)** and **1,355 nodes (51.88%)**. The p99 is also below
+  the 20 ms objective.
+- The benchmark endpoint inside this profiled run reports 125.060 steady
+  decode token/s; this is trajectory evidence, not an unprofiled throughput
+  claim. All 128 output
+  token IDs and hash `fe0300...` match the baseline exactly. Probabilistic
+  acceptance changed slightly from 4.129 (31 draft rounds) to 4.000 (32 draft
+  rounds), so the Gemma suffix fusion remains a Type-B candidate pending a
+  distribution-quality gate rather than being accepted from one trajectory.
+
+The reduction is cumulative: the one-pass GDN output norm first reached
+22.646 ms / 2,084 nodes; fused GDN split materialization reached 21.625 ms /
+1,892 nodes; the dynamic-shape-correct Gemma residual RMS fusion reached the
+19.317 ms / 1,257-node result above. A prior `v2` launch omitted the installed
+`flash_attn_v100_cuda` extension directory from `PYTHONPATH` and failed during
+graph capture; it is not a performance result.
+
+### Remaining graph-boundary cost
+
+Across 31 steady boundaries per rank, the draft-graph end to target-graph
+start interval is 5.776 ms mean (5.582 ms p50). Only 1.304 ms is covered by
+non-graph GPU kernels, leaving about 4.47 ms of launch, synchronization, and
+CPU queueing bubbles. Every boundary submits 153 kernels:
+
+- one TP `cross_device_reduce_1stage`: 0.785 ms;
+- 20 `DeviceScanKernel`, 20 `DeviceScanInitKernel`, 20 `compute_cuda_kernel`,
+  and 21 `indexSelectSmallIndex` calls: 0.276 ms service but much larger
+  serialized submission cost;
+- remaining input, slot, block-table, GDN metadata, and elementwise kernels:
+  about 0.243 ms service.
+
+The scan/select work arrives in five serial groups with scalar D2H ordering
+points. Therefore the next boundary objective is not a faster individual
+3-microsecond kernel. It is to construct persistent target metadata once and
+capture or batch-submit the five repeated groups while preserving every
+buffer/update dependency.
+
+The same parser applied to the retained SGLang-V100 trace gives a useful
+matched structural target. Its draft-to-target interval is 3.398 ms mean with
+30 non-graph kernels and 0.115 ms GPU service, versus this branch's 5.776 ms,
+153 kernels, and 1.304 ms service. SGLang still pays a 2.715 ms host
+`cudaStreamSynchronize`, so it is not a zero-overhead endpoint. The immediate
+vLLM gap is nevertheless concrete: remove 123 repeated launches and move the
+roughly 0.785 ms TP reduction adjacent to target input/embedding preparation
+into the target replay dependency chain. This comparison comes from
+`/data/models/v100-dflash2-20260820/sglang-audit/perf-rootcause/sglang-dflash2-single1-step20-v2.sqlite`.
+
+### Preliminary probabilistic quality pair
+
+A fixed 16-question sequential GSM8K pair used graph TP4, target E5M2 KV,
+draft FP16 KV, block eight, and official `temperature=1.0/top_p=.95/top_k=20`
+sampling. The control artifact is
+`quality/gsm8k-16-control-gemma-off.json`; the candidate artifact is
+`quality/gsm8k-16-candidate-gemma-on.json` under the task cache.
+
+- Control: 68.75% accuracy, aggregate acceptance length 4.470.
+- Candidate: 75.00% accuracy, aggregate acceptance length 4.693.
+- Eight of 16 full output-token trajectories match. Eight diverge under
+  probabilistic sampling, as expected from the accepted one-FP16-ULP numeric
+  bound; this small sample cannot establish a quality improvement.
+
+The Gemma fusion stays default-off until paired prompt perplexity and broader
+dataset gates show no regression. The GDN norm and split stages retain their
+Type-A classification and can be defaulted independently of that decision.
+
+The first deterministic distribution probe scores 1,850 prompt tokens from 32
+fixed GSM8K questions in eager target prefill (Graph is irrelevant to prompt
+logprobs). Weighted perplexity is 4.20119 for the decomposed control and
+4.20172 for the Gemma fusion, a +0.00053 / +0.013% change. All 32 next-token
+argmaxes match. Mean absolute prompt-logprob difference is 0.00173 and the
+worst token is 0.02524. This is small enough to continue dataset testing but
+confirms that the kernel is Type B, so it remains default-off.
+
+### Fused Flash-V100 small-query metadata candidate
+
+The five repeated scan groups are generated by
+`FlashAttnV100MetadataBuilder._update_smallq_decode_metadata`: each of five
+target KV groups performs four `repeat_interleave` scans, then materializes and
+copies block-table and sequence-length temporaries. The default-off
+`VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA` candidate writes the persistent
+block-table, sequence-length, and query-boundary buffers directly with one
+Triton launch per group. It is limited to a DFlash2 target on SM70; draft,
+DDTree, Eagle, MTP, and CPU metadata retain the existing path.
+
+- Exact V100 tests pass for B1 and mixed B3/B4 layouts, negative block IDs,
+  zero-length padded requests, and graph-token padding.
+- The unchanged CPU persistent-buffer, padding, and overflow tests pass.
+- A realistic `q=8`, three block columns, five-group microbenchmark reports
+  1.278 ms legacy versus 0.114 ms fused wall time and 1.235 versus 0.100 ms GPU
+  service: **1.164 ms saved / 11.2x** for this isolated constructor.
+
+The microbenchmark is only a go/no-go gate. Acceptance still requires a
+matched end-to-end node trace proving that the 20 DeviceScan groups disappear,
+the draft-to-target interval shrinks, and output/acceptance evidence remains
+within its classified gate.

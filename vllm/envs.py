@@ -180,8 +180,9 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = False
-    VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_NORM: bool = True
+    VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT: bool = True
+    VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA: bool = False
     VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
@@ -1774,16 +1775,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
     ),
     # Route the Qwen3.8 target GDN output gate through the existing one-pass
-    # CUDA RMSNormGated implementation. Keep this DFlash2/SM70-only and
-    # default-off until paired target-graph and quality gates pass.
+    # CUDA RMSNormGated implementation. This is DFlash2/SM70-only and defaults
+    # on after exact target-graph and output-token gates; set 0 to diagnose.
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "0"))
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_NORM", "1"))
     ),
     # Fuse the safe nonzero-offset Qwen3.8 GDN z/b/a materialization into one
     # copy kernel. This must stay separate from the plain-view path because
     # nonzero-offset views are unsafe under the SM70 compile/full-graph route.
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": lambda: bool(
-        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "0"))
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT", "1"))
+    ),
+    # Build Flash-V100 small-query verifier rows directly in their persistent
+    # graph buffers. This replaces four repeat_interleave scans per KV group.
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA", "0"))
     ),
     # Fuse the FP16 projection + FP32 residual + Gemma RMSNorm suffix used by
     # small DFlash2 verifier graphs. Default-off pending numeric/quality gates.
