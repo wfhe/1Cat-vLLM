@@ -283,7 +283,7 @@ def _event_trials(
         if cache_scrub is not None:
             cache_scrub.add_(1)
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     samples_us: list[float] = []
     for _ in range(trials):
         if cache_scrub is None:
@@ -333,7 +333,7 @@ def _benchmark_eager(
 ) -> dict[str, Any]:
     timing = _event_trials(launch, warmup, iters, trials, cache_scrub)
     launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return {"timing": timing, "replay_max_abs": None}
 
 
@@ -355,14 +355,14 @@ def _benchmark_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
         launch()
-    torch.cuda.synchronize(output.device)
+    torch.accelerator.synchronize(output.device)
 
     timing = _event_trials(graph.replay, warmup, iters, trials, cache_scrub)
     graph.replay()
-    torch.cuda.synchronize(output.device)
+    torch.accelerator.synchronize(output.device)
     first = output.clone()
     graph.replay()
-    torch.cuda.synchronize(output.device)
+    torch.accelerator.synchronize(output.device)
     replay_max_abs = float((output - first).abs().max().item())
     del first, graph, capture_stream
     gc.collect()
@@ -398,8 +398,20 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
     gated_silu = case == "gate_up_fused"
     output_n = n // 2 if gated_silu else n
     raw = qweight.view(torch.uint8)
-    codes = _qpn8_prepack(raw)
-    group_scales = _qpn8_group_scales(scales, n, k)
+    reference_codes = _qpn8_prepack(raw)
+    reference_group_scales = _qpn8_group_scales(scales, n, k)
+    if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
+        codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(qweight, scales)
+        prepare_matches_reference = bool(
+            torch.equal(codes.view(-1), reference_codes)
+            and torch.equal(group_scales, reference_group_scales)
+        )
+        if not prepare_matches_reference:
+            raise RuntimeError("source QPN8 prepare disagrees with Python reference")
+    else:
+        codes = reference_codes
+        group_scales = reference_group_scales
+        prepare_matches_reference = None
     tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
         qweight, scales, 128, gated_silu
     )
@@ -410,7 +422,7 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
         dtype=torch.uint8,
         device=device,
     )
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
     case_result: dict[str, Any] = {
         "case": case,
@@ -421,6 +433,7 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
         "tm_meta": {"k_ld": k_ld, "q_ld": q_ld},
         "packed_bytes": int(codes.numel()),
         "group_scale_shape": list(group_scales.shape),
+        "source_prepare_matches_reference": prepare_matches_reference,
         "rows": [],
     }
 
@@ -464,7 +477,7 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
             )
 
         launch_tm()
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
         tm_quality = _error_stats(tm_out, reference)
         tm_bytes = n * k + 2 * (k // 128) * n + 2 * m * (output_n + k)
         for cache_state in args.cache_state:
@@ -545,7 +558,7 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
                     )
 
             launch_qpn()
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             quality = _error_stats(qpn_out, reference)
             quality_pass = _quality_pass(
                 quality, args.relative_l2_limit, args.cosine_limit
@@ -607,11 +620,13 @@ def _run_case(args: argparse.Namespace, case: str) -> dict[str, Any]:
         tm_scales,
         codes,
         group_scales,
+        reference_codes,
+        reference_group_scales,
         qweight,
         scales,
         cache_scrub,
     )
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
     return case_result
 
@@ -681,7 +696,7 @@ def main() -> int:
     if args.warmup < 1 or args.iters < 1 or args.trials < 1 or args.cache_scrub_mib < 1:
         raise ValueError("warmup, iters, trials, and cache scrub size must be positive")
 
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device.index or 0)
     cases = [_run_case(args, case) for case in args.cases]
     summary = _summarize(cases)
     payload = {

@@ -156,6 +156,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS: bool = True
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
+    VLLM_SM70_FP8_QPN8: bool = True
+    VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
@@ -1612,6 +1614,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FP8_PREFILL_EXACT_DENSE": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_PREFILL_EXACT_DENSE", "1"))
     ),
+    # Memory-neutral QPN8 layout for model-, shape-, and runtime-gated
+    # Qwen3.8 TP4 no-MTP dense projections. Native M<=8 decode reads the FP8
+    # layout directly; larger prefill M uses the correctness fallback. Set
+    # this to 0 for an explicit TurboMind layout.
+    "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "1"))),
+    # Optional source-built QPN8-only extension. Production builds leave this
+    # unset because the same operators are linked into vllm._C.
+    "VLLM_SM70_FP8_QPN8_LIBRARY": lambda: os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY", None),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
     # hidden-state reduction. This is default-off until it wins end-to-end.
