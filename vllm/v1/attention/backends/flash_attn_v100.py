@@ -316,7 +316,7 @@ def _g6_aligned_page_partition_size_hint(
     ):
         return None
     if (
-        kv_cache_dtype in ("auto", "bfloat16")
+        kv_cache_dtype in ("auto", "float16", "bfloat16")
         and key_cache.dtype == torch.float16
         and key_cache.shape[1] == 784
     ):
@@ -324,6 +324,12 @@ def _g6_aligned_page_partition_size_hint(
         # selects between them from device seq_lens. Plan the p256 workspace
         # envelope once.
         return 256
+    if kv_cache_dtype in ("fp8", "fp8_e4m3") and key_cache.dtype == torch.uint8:
+        # Qwen3.8 TP4 has G6/D256 attention and checkpoint-provided E4M3
+        # scales. The p64 route wins the accepted 1K-2K operator sweep while
+        # preserving the p256 scalar route's E4M3 conversion within one fp16
+        # output ULP.
+        return 64
     if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
         # Plan the largest p256 workspace once. The extension selects p256 or
         # p1024 from device seq_lens, so CUDA graph replay keeps one
@@ -4171,7 +4177,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return False
 
         fp16_kv = (
-            self.kv_cache_dtype in ("auto", "bfloat16")
+            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
             and key_cache.dtype == torch.float16
             and value_cache.dtype == torch.float16
         )
@@ -5335,13 +5341,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             else 0
         )
         xqa_kv_supported = (
-            self.kv_cache_dtype in ("auto", "bfloat16")
-            and key_cache.dtype == torch.float16
-            and value_cache.dtype == torch.float16
-        ) or (
-            self.kv_cache_dtype == "fp8_e5m2"
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
+            (
+                self.kv_cache_dtype in ("auto", "float16", "bfloat16")
+                and key_cache.dtype == torch.float16
+                and value_cache.dtype == torch.float16
+            )
+            or (
+                self.kv_cache_dtype == "fp8_e5m2"
+                and key_cache.dtype == torch.uint8
+                and value_cache.dtype == torch.uint8
+            )
+            or (
+                self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                and key_cache.dtype == torch.uint8
+                and value_cache.dtype == torch.uint8
+            )
         )
 
         # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
@@ -5355,6 +5369,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and key_cache.shape[2] > 0
             and query.shape[1] % key_cache.shape[2] == 0
             and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
+            and (
+                self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+                or (query.shape[0] == 1 and q_per_kv == 6)
+            )
             and (
                 self.kv_cache_dtype != "fp8_e5m2"
                 or (q_per_kv != 4 and _decode_fp8_xqa_allowed(attn_metadata, query))

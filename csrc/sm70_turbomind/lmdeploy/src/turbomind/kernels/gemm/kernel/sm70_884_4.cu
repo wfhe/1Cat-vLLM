@@ -120,6 +120,10 @@ void Registry::sm70_884_4()
         Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 16>>();
         Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 16>>();
+        using C32K64L1 = C::Type<8, 32, 64, 1, 1, 1, D, S, 2, true, 1, 16>;
+        using C32K64L2 = C::Type<8, 32, 64, 1, 1, 1, D, S, 2, true, 1, 16, -1, -1, 2>;
+        Add(std::make_unique<ExactMnkKernelImpl<typename C32K64L1::Kernel, 1, 8704, 5120>>());
+        Add(std::make_unique<ExactMnkKernelImpl<typename C32K64L2::Kernel, 1, 5120, 4352>>());
         // clang-format on
     }
 }

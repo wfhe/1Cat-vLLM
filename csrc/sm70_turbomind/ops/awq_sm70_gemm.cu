@@ -1087,6 +1087,12 @@ bool nvfp4_tune_small_shapes_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
+  return raw == nullptr || std::atoi(raw) != 0;
+}
+
 bool fp8_moe_single_token_per_expert_dispatch_enabled() {
   const char* raw =
       std::getenv("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_PER_EXPERT_DISPATCH");
@@ -1304,6 +1310,11 @@ turbomind::gemm::DispatchPolicy select_mxfp4_dense_dispatch_policy(
 
 turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream) {
+  if (nvfp4_qwen38_tp4_m1_fast_selector_enabled() && m == 1 &&
+      group_size == 16 &&
+      ((n == 8704 && k == 5120) || (n == 5120 && k == 4352))) {
+    return turbomind::gemm::DispatchPolicy::kDefault;
+  }
   return select_dense_dispatch_policy_impl(
       device, m, n, k, group_size, stream, TuneKeyKind::kNvfp4Dense,
       nvfp4_tune_small_shapes_enabled(), false, nvfp4_dense_tune_max_m());
@@ -2802,10 +2813,13 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
   const int64_t k = qweight.size(1);
   TORCH_CHECK(k % 8 == 0 && n % 8 == 0,
               "fp8_sm70_prepare: K and N must be multiples of 8.");
-  TORCH_CHECK(scales.size(0) == (n + group_size - 1) / group_size,
-              "fp8_sm70_prepare: output scale block mismatch.");
-  TORCH_CHECK(scales.size(1) == (k + group_size - 1) / group_size,
-              "fp8_sm70_prepare: input scale block mismatch.");
+  const bool channelwise_scales = scales.size(0) == n && scales.size(1) == 1;
+  const bool blockwise_scales =
+      scales.size(0) == (n + group_size - 1) / group_size &&
+      scales.size(1) == (k + group_size - 1) / group_size;
+  TORCH_CHECK(channelwise_scales || blockwise_scales,
+              "fp8_sm70_prepare: expected [N, 1] channel scales or "
+              "[ceil(N/128), ceil(K/128)] block scales.");
 
   const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kFloat8_e4m3, turbomind::kHalf, true, 70);
@@ -2869,12 +2883,21 @@ std::vector<torch::Tensor> fp8_sm70_prepare(torch::Tensor qweight,
   const bool is_B_s = !is_A_s;
   const int64_t num_groups = (k + group_size - 1) / group_size;
 
-  auto group_scales = scales.transpose(0, 1)
-                          .contiguous()
-                          .to(torch::kFloat16)
-                          .repeat_interleave(group_size, 1)
-                          .slice(1, 0, n)
-                          .contiguous();
+  torch::Tensor group_scales;
+  if (channelwise_scales) {
+    group_scales = scales.transpose(0, 1)
+                       .contiguous()
+                       .to(torch::kFloat16)
+                       .repeat({num_groups, 1})
+                       .contiguous();
+  } else {
+    group_scales = scales.transpose(0, 1)
+                       .contiguous()
+                       .to(torch::kFloat16)
+                       .repeat_interleave(group_size, 1)
+                       .slice(1, 0, n)
+                       .contiguous();
+  }
   if (interleave_gated_silu) {
     group_scales = interleave_gated_silu_cols(group_scales);
   }

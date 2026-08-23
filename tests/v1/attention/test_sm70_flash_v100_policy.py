@@ -1516,6 +1516,66 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
     assert torch.all(output == 1)
 
 
+def test_flash_v100_decode_uses_xqa_for_e4m3_g6_d256(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8_e4m3",
+    )
+    calls: list[tuple[str, int | None, str | None]] = []
+
+    def hit_xqa(*args, **kwargs):
+        calls.append(
+            (
+                "xqa",
+                kwargs.get("partition_size_hint"),
+                kwargs.get("kv_cache_dtype"),
+            )
+        )
+        kwargs["out"].fill_(1)
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("E4M3 G6/D256 decode should select XQA")
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        seq_lens=torch.tensor([1025], dtype=torch.int32),
+        flash_v100_decode_max_seq_len_hint=1025,
+        flash_v100_decode_workspace_seq_capacity_hint=262144,
+        flash_v100_decode_active_num_partitions=torch.tensor([5], dtype=torch.int32),
+    )
+    layer = SimpleNamespace(_k_scale_float=0.04, _v_scale_float=0.25)
+    query = torch.zeros((1, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    kv_cache = torch.zeros((2, 2, 1568, 1, 256), dtype=torch.uint8)
+
+    result = impl._flash_v100_decode(
+        layer,
+        query,
+        query,
+        query,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+
+    assert result is output
+    assert calls == [("xqa", 64, "fp8_e4m3")]
+    assert torch.all(output == 1)
+
+
 @pytest.mark.parametrize(
     ("num_heads", "seq_len", "expected_route"),
     (
@@ -2079,7 +2139,7 @@ def test_flash_v100_decode_e5m2_keeps_small_pages_on_default_planner(monkeypatch
     )
 
 
-def test_flash_v100_decode_e4m3_does_not_use_e5m2_partition_hint(monkeypatch):
+def test_flash_v100_decode_e4m3_uses_exact_p64_partition_hint(monkeypatch):
     from vllm.v1.attention.backends.flash_attn_v100 import (
         _g6_aligned_page_partition_size_hint,
     )
@@ -2091,7 +2151,7 @@ def test_flash_v100_decode_e4m3_does_not_use_e5m2_partition_hint(monkeypatch):
 
     assert (
         _g6_aligned_page_partition_size_hint(query, key_cache, key_cache, "fp8_e4m3")
-        is None
+        == 64
     )
 
 

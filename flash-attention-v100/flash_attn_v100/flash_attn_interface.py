@@ -18,6 +18,7 @@ except ImportError:
 
 DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
+E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 1024)
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
@@ -152,6 +153,7 @@ def _get_decode_plan(
     workspace_seq_capacity_hint: int | None = None,
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
+    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -184,6 +186,7 @@ def _get_decode_plan(
         _validate_decode_partition_size(
             int(partition_size_hint),
             "partition_size_hint",
+            valid_partition_sizes,
         )
         if partition_size_hint is not None
         else _get_decode_partition_size(
@@ -529,11 +532,13 @@ def _select_default_decode_partition_size(
     return DEFAULT_DECODE_PARTITION_SIZE
 
 
-def _validate_decode_partition_size(value: int, name: str) -> int:
-    if value not in VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            f"{name} must be one of {VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
+def _validate_decode_partition_size(
+    value: int,
+    name: str,
+    valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
+) -> int:
+    if value not in valid_partition_sizes:
+        raise ValueError(f"{name} must be one of {valid_partition_sizes}, got {value}")
     return value
 
 
@@ -1016,6 +1021,14 @@ def flash_attn_decode_paged_xqa(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
+        valid_partition_sizes=(
+            E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+            if kv_cache_dtype in ("fp8", "fp8_e4m3")
+            and q.shape == (1, 6, 256)
+            and k_cache.dtype == torch.uint8
+            and v_cache.dtype == torch.uint8
+            else VALID_DECODE_PARTITION_SIZES
+        ),
     )
     _assert_decode_launch_covers_seq_lens(
         plan,

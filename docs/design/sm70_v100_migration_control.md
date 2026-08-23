@@ -41710,3 +41710,24 @@ Interpretation:
   M=9/11/16 row-tile route, followed by larger concurrency crossovers; do not
   compose an eight-row launch with a separate tail or promote the current
   large-M temporary as an accepted throughput implementation.
+
+## 2026-08-23 Qwen3.8-27B-NVFP4 TP4 decode recovery
+
+- Recovered the mixed NVFP4/channel-FP8 checkpoint without crediting Marlin:
+  accepted FP8 projection shapes use QPN8, remaining FP8 projections and the
+  LM head use TurboMind W8A16, and NVFP4 uses TurboMind W4A16.
+- Added channelwise FP8 TurboMind packing, exact NVFP4 N32 selectors, E4M3
+  Flash-V100 XQA, QPN8 split-12 for the K1536 x N5120 output projection, and
+  an exact B1/G6/D256 E4M3 p64 attention partition.
+- Frozen TP4 I1024/O256, E4M3 KV, official random sampling, no-MTP, and full
+  CUDA graph decode is **71.732 tok/s** at **13.941 ms/token** with the native
+  sampler. The clean p128 control is 69.904 tok/s at 14.305 ms/token.
+- The p64 operator sweep saves 9.55-16.98 us per attention launch from sequence
+  lengths 1025-2049. All p64/p128 cases stay within one FP16 output ULP of the
+  scalar reference; the focused GPU suite passes 6/6.
+- Compact and fused top-k20 sampler experiments were removed because their
+  sampled trajectories were not deterministic against the native route. They
+  are not part of the 71.732 tok/s claim.
+- Full contract, route map, staged results, profile table, numerical evidence,
+  rejected paths, rollback controls, and artifacts are in
+  `docs/design/sm70_qwen38_nvfp4_decode.md`.

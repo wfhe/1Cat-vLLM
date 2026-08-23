@@ -443,7 +443,7 @@ def fp8_qpn8_prepare_sm70(
     qweight: torch.Tensor,
     scales: torch.Tensor,
 ) -> list[torch.Tensor]:
-    """Pack checkpoint-native block FP8 weights into the QPN8 layout."""
+    """Pack checkpoint-native block/channel FP8 weights into QPN8 layout."""
     return _op("fp8_qpn8_prepare_sm70")(qweight, scales)
 
 
@@ -457,8 +457,9 @@ if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
         n = qweight.size(0)
         k = qweight.size(1)
         codes = torch.empty((k, n), dtype=torch.uint8, device=qweight.device)
+        scale_shape = (1, n) if scales.shape == (n, 1) else (k // 128, n // 32)
         group_scales = torch.empty(
-            (k // 128, n // 32), dtype=torch.float16, device=scales.device
+            scale_shape, dtype=torch.float16, device=scales.device
         )
         return [codes, group_scales]
 

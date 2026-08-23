@@ -854,6 +854,19 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
 
+    def apply_fused_silu_and_mul(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        fused_apply = getattr(scheme, "apply_fused_silu_and_mul", None)
+        if fused_apply is None:
+            return None
+        return fused_apply(layer, x)
+
 
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
     """

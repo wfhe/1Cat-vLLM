@@ -18,7 +18,8 @@
 namespace {
 
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
-  if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16") {
+  if (kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
+      kv_cache_dtype == "bfloat16") {
     return flash_v100::KV_CACHE_DTYPE_FP16;
   }
   if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
@@ -434,6 +435,50 @@ __device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
       fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
 }
 
+__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(
+    const uint8_t raw) {
+  const uint16_t sign = static_cast<uint16_t>(raw & 0x80u) << 8;
+  const uint8_t magnitude = raw & 0x7fu;
+  const uint8_t exponent = magnitude >> 3;
+  const uint8_t mantissa = magnitude & 0x07u;
+  if (magnitude == 0) {
+    return sign;
+  }
+  if (exponent == 0) {
+    // E4M3 subnormals are exact fp16 normals: mantissa * 2^-9.
+    const uint16_t magnitude_bits =
+        mantissa < 2
+            ? 0x1800u
+            : (mantissa < 4
+                   ? static_cast<uint16_t>(0x1c00u | ((mantissa - 2) << 9))
+                   : static_cast<uint16_t>(0x2000u | ((mantissa - 4) << 8)));
+    return sign | magnitude_bits;
+  }
+  if (magnitude == 0x7fu) {
+    return sign | 0x7e00u;
+  }
+  return sign | static_cast<uint16_t>((exponent + 8) << 10) |
+         static_cast<uint16_t>(mantissa << 7);
+}
+
+__device__ __forceinline__ uint32_t fp8_e4m3fn_pair_to_half2_bits(
+    const uint16_t raw_pair) {
+  return static_cast<uint32_t>(
+             fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair))) |
+         (static_cast<uint32_t>(fp8_e4m3fn_to_half_bits(
+              static_cast<uint8_t>(raw_pair >> 8)))
+          << 16);
+}
+
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8(
+    const uint64_t raw) {
+  return make_uint4(
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
+}
+
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16>
 __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
@@ -480,11 +525,16 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
     return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
   } else {
-    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "XQA only supports fp16 and FP8 E5M2 KV");
+    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+                  "XQA only supports fp16, FP8 E4M3, and FP8 E5M2 KV");
     const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
-    return fp8_e5m2_vector_to_half8(
-        __ldg(&cache_vec[physical_offset / 8 + vec_col]));
+    const uint64_t raw = __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+    if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+      return fp8_e4m3fn_vector_to_half8(raw);
+    } else {
+      return fp8_e5m2_vector_to_half8(raw);
+    }
   }
 }
 
@@ -2150,7 +2200,8 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           int BLOCK_SIZE = 0, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool ALIGNED_PADDED_SMEM = false,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
-          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false>
+          bool PARTITION_PAGE_IDS = false, bool E5M2_PAIR_LOAD = false,
+          int KV_DTYPE_OVERRIDE = -1>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -2208,7 +2259,14 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             route_seq_len_end, route_seq_len_final);                           \
   } while (0)
 
-  if constexpr (E5M2_PAIR_LOAD) {
+  if constexpr (KV_DTYPE_OVERRIDE ==
+                flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+    static_assert(!E5M2_PAIR_LOAD,
+                  "E5M2 paired loads cannot be used for E4M3 KV");
+    TORCH_CHECK(k_cache.scalar_type() == at::kByte,
+                "E4M3 XQA requires uint8 KV cache");
+    LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
+  } else if constexpr (E5M2_PAIR_LOAD) {
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
                 "Paired XQA loads require FP8 E5M2 KV cache");
     LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_FP8_E5M2);
@@ -2576,8 +2634,10 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16 ||
+                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-              "XQA decode supports fp16 and fp8_e5m2 KV cache only");
+              "XQA decode supports fp16, fp8_e4m3, and fp8_e5m2 KV cache "
+              "only");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16 &&
                     v_cache.dtype() == torch::kFloat16,
@@ -2585,7 +2645,7 @@ at::Tensor flash_attention_decode_paged_xqa(
   } else {
     TORCH_CHECK(
         k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
-        "fp8_e5m2 XQA requires uint8 K/V tensors");
+        "FP8 XQA requires uint8 K/V tensors");
   }
   TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
               "XQA K/V scales must be positive");
@@ -2623,7 +2683,8 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(q_per_kv == 4 || q_per_kv == 6 || q_per_kv == 8,
               "XQA decode supports q_per_kv in {4, 6, 8}, got ", q_per_kv);
   TORCH_CHECK(
-      partition_size == 256 || partition_size == 512 || partition_size == 1024,
+      partition_size == 64 || partition_size == 128 || partition_size == 256 ||
+          partition_size == 512 || partition_size == 1024,
       "Unsupported XQA decode partition_size: ", partition_size);
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
@@ -2648,6 +2709,40 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+  if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+    TORCH_CHECK(q.size(0) == 1 && q_per_kv == 6 &&
+                    (partition_size == 64 || partition_size == 128 ||
+                     partition_size == 256),
+                "E4M3 XQA currently supports B=1, q_per_kv=6, D=256, and "
+                "partition_size in {64, 128, 256} only");
+    if (partition_size == 64) {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          64, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteAllSeqLens, false, false, false,
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, 8, stream);
+    } else if (partition_size == 128) {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          128, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteAllSeqLens, false, false, false,
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, 8, stream);
+    } else {
+      launch_flash_attention_decode_paged_xqa_tc_256_wide<
+          256, 6, true, kXQATC256WideThreads, 1, 0, false, false,
+          kXQARouteAllSeqLens, false, false, false,
+          flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
+          q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
+          exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
+          launch_num_partitions, false, 8, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+  }
   // Default only the shape with exact direct and model-level evidence.
   const bool padded_smem_enabled = xqa_padded_smem_enabled();
   const bool use_padded_smem =

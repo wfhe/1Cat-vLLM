@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_QPN8_LIBRARY: str | None = None
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
+    VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -1673,6 +1674,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES", "1"))
+    ),
+    "VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR", "1"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))

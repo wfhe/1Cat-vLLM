@@ -91,6 +91,12 @@ bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled()
     return !raw || std::atoi(raw) != 0;
 }
 
+bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled()
+{
+    const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
+    return !raw || std::atoi(raw) != 0;
+}
+
 struct Sm70AwqTp2FastTarget {
     int  n;
     int  k;
@@ -167,8 +173,17 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(const GemmDesc&  
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(const GemmDesc& desc)
 {
-    const bool        awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
     const std::string desc_str = to_string(desc);
+    if (Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled()) {
+        // Qwen3.8-27B NVFP4 TP4 decode. The exact-MNK registry entries keep
+        // these small-N tactics out of prefill and unrelated model shapes.
+        if (desc_str == "sm70_f16_e2m1k16_f16_tnt_fff_1x8704x5120_1"
+            || desc_str == "sm70_f16_e2m1k16_f16_tnt_fff_1x5120x4352_1") {
+            return Sm70AwqTp2FastTarget{
+                desc.n, desc.k, 8, 32, 64, 3, 4, true, "c8x32_a1x1x64_01"};
+        }
+    }
+    const bool awq_fast_selector_enabled = Sm70AwqTp2FastSelectorEnabled();
     if (awq_fast_selector_enabled) {
         if (auto target = GetSm70AwqTp2EnvFastTarget(desc, desc_str)) {
             return target;
