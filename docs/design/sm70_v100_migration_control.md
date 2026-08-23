@@ -41735,6 +41735,14 @@ Interpretation:
   XQA GPU numerical cases, Ruff lint/format, and `git diff --check`. The final
   `_C` and Flash-V100 SHA256 values are `e0ea14d0...7624` and
   `b418fed8...dce7`.
+- The latest merged p64 Nsight Systems trace captures 63 decode replays on all
+  four ranks. Steady replay/GPU-union time is 14.621/14.055 ms, GPU activity
+  union is 96.136%, and the route launches 1140.8 kernels/rank/token. NVML
+  samples show 99.47% GPU busy-window duty but only 48.26% memory-active duty;
+  69.40% of service has a grid-limited occupancy ceiling below 25%. Current NCU
+  counters remain unavailable because the driver rejects non-root counter
+  access with `ERR_NVGPUCTRPERM`; do not present NVML duty or effective payload
+  rates as achieved SM or HBM throughput.
 - Full contract, route map, staged results, profile table, numerical evidence,
   rejected paths, rollback controls, and artifacts are in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.

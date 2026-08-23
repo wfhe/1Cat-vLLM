@@ -101,24 +101,49 @@ operator gates recorded in `sm70_qwen38_qpn8_decode.md`.
 
 ## Per-Token Profile
 
-The short Nsight Systems node trace is composition evidence; its traced TPOT
-is not used as the absolute speed result. Before p64, the steady critical rank
-contains approximately:
+The latest short Nsight Systems node trace uses the merged p64 route. It is
+composition evidence; its 14.635 ms traced TPOT is not used as the absolute
+speed result because the unprofiled frozen request measures 14.017 ms. The
+trace captures 63 decode replays on each TP rank and uses the 61 middle steps
+for steady statistics. Graph-node kernel coverage is 93.48%.
 
 | Component | Time/token |
 |---|---:|
-| QPN8 regular projections | 3.151 ms |
-| NVFP4 gate/up | 2.740 ms |
-| NVFP4 down | 1.702 ms |
-| TP all-reduce | 1.676 ms |
-| E4M3 XQA p128 | 0.892 ms |
-| QPN8 fused gate/up | 0.506 ms |
-| TurboMind FP8 LM head | 0.407 ms |
+| TurboMind NVFP4 gate/up | 2.762 ms |
+| QPN8 split-16 projections | 2.234 ms |
+| TurboMind NVFP4 down | 1.706 ms |
+| TP all-reduce | 1.697 ms |
+| QPN8 split-12 projections | 0.895 ms |
+| E4M3 XQA p64 | 0.587 ms |
+| QPN8 fused gate/up | 0.508 ms |
+| TurboMind FP8 dense/LM head | 0.407 ms |
 
-The p64 operator race predicts 0.15-0.27 ms/token attention savings across
-the roughly 16 attention launches. The full model measures 0.365 ms/token;
-the excess is within run-to-run system variation, so only the measured full
-result is used for the final speed claim.
+Across rank-token samples, the replay interval is 14.621 ms and GPU activity
+union is 14.055 ms, or 96.136% of the interval. Idle gaps total 0.565 ms/token.
+The stream still launches 1140.8 kernels per rank per token; half are shorter
+than 5 us. The grid-limited static occupancy ceiling places 69.40% of service
+below 25% occupancy and 28.50% at 25-50%. Nearly continuous GPU work therefore
+does not imply high useful compute utilization: batch-one launch geometry and
+the serial projection/communication chain remain the main limit.
+
+Fifty-millisecond NVML samples report 99.47% mean GPU busy-window duty and
+48.26% memory-active-window duty. Per-GPU power averages 175.9-180.2 W and
+peaks at 221.4 W; runtime allocation peaks at 29.06-29.36 GiB/GPU. Model loading
+accounts for 5.77 GiB/GPU, while the configured cache budget reports 21.29
+GiB/GPU; the remaining allocation includes CUDA graphs, workspaces, state, and
+runtime context.
+
+NVML memory duty is not achieved HBM bandwidth. Current trace durations imply
+effective minimum packed-weight rates of 451.2 GB/s for NVFP4 gate/up, 365.1
+GB/s for NVFP4 down, and 717.4 GB/s for QPN8 down, with useful arithmetic rates
+of 1.805, 1.461, and 1.435 TFLOP/s/GPU respectively. These omit scales,
+activation/output traffic, caches, and implementation-internal work. A current
+NCU capture was attempted, but the host rejected non-root performance-counter
+access with `ERR_NVGPUCTRPERM`; exact current SM, Tensor Core, occupancy, and
+DRAM counters therefore require administrative profiling permission. The
+previously accepted QPN8 counter evidence remains in
+`sm70_qwen38_qpn8_decode.md`, but it is not credited as current NVFP4 or p64
+XQA counter evidence.
 
 ## Rejected Experiments
 
