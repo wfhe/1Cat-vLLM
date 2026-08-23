@@ -537,13 +537,47 @@ Goal:
       host-synchronized metadata fan-out rather than the fused kernel's own
       1.528 ms aggregate GPU service.
     - These endpoint values were collected under low-overhead Graph-level
-      Nsight tracing and are the accepted matched A/B for this leaf. A short
-      node-level trace is still required to update the semantic Draft-to-Target
-      and target-verifier phase table; node tracing will be used for
-      composition only because it inflates absolute latency.
+      Nsight tracing and are the accepted matched A/B for this leaf. The short
+      node-level trace below updates the semantic Draft-to-Target and
+      target-verifier phase table; it is used for composition only because node
+      tracing inflates absolute latency.
   Artifacts are
   `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/results/dflash2-fused-viewcache-b1-graph-o512-{v2,v4}.json` and
   `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/profiles/latest-e2e/dflash2-fused-viewcache-b1-graph-v4.{qdstrm,nsys-rep,sqlite}`.
+- A follow-up 128-token node trace at source
+  `9b8af0dbbe1d48214a555a96bbe762d26524e87c` supplies the missing semantic
+  phase split. The trace contains 32 complete draft-to-draft intervals; after
+  dropping the first and last edge intervals, 30 steady rounds remain. For
+  every phase and round the table takes the slowest of the four TP ranks, which
+  matches the earlier vLLM/SGLang audit methodology.
+
+  | traced phase | old vLLM mean (ms) | fused vLLM mean / p50 / p90 / p99 (ms) | SGLang mean (ms) | fused launches per rank |
+  | --- | ---: | ---: | ---: | ---: |
+  | draft Graph | 4.065 | 4.046 / 4.048 / 4.078 / 4.090 | 3.961 | 185 |
+  | draft to target | 18.382 | 4.934 / 4.855 / 5.049 / 6.426 | 3.517 | 153 |
+  | target Graph | 24.835 | 24.740 / 24.747 / 24.892 / 24.907 | 19.723 | 2,612 |
+  | target to next draft | 2.791 | 2.838 / 2.840 / 2.849 / 2.934 | 4.216 | 63 |
+  | complete traced round | 49.860 | 36.300 / 36.257 / 36.424 / 37.827 | 31.212 | n/a |
+
+  The persistent/fused metadata path therefore removes 13.448 ms (`73.16%`)
+  and 278 launches per rank (`64.50%`) from Draft-to-Target. The remaining gap
+  to SGLang in that phase is 1.417 ms and 123 launches, while the complete
+  traced-round gap is 5.088 ms. The dominant residual is now the target Graph:
+  24.740 versus 19.723 ms (`+5.017 ms`), not the 4.046 ms draft Graph.
+- The remaining 153 Draft-to-Target eager kernels per rank are stable across all
+  30 steady rounds. They include one fused GDN metadata launch (0.0037 ms GPU
+  service), one TP4 one-stage reduce (0.2357 ms), 40 CUB scan/init launches
+  (0.1161 ms), 22 direct-copy launches (0.0686 ms), 20 index-select launches
+  (about 0.0926 ms), and 20 `compute_cuda_kernel<int>` launches (0.0614 ms),
+  plus small slot/block/RoPE/input-mapping kernels. Critical-rank GPU service is
+  only 0.989 ms on average inside the 4.934 ms wall interval, so the next
+  Draft-to-Target leaf should share/capture the residual common-attention and
+  input-mapping fan-out rather than tune the 3.7-us fused kernel. In parallel,
+  the larger end-to-end opportunity is the verifier Graph's generic
+  elementwise/copy/state fan-out and TP4 reduction path.
+  Artifacts are
+  `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/results/dflash2-fused-viewcache-b1-nodes-o128-v5.json` and
+  `/data/minimax-h3/task-cache/v100-dflash2-pr257-gdn-metadata/profiles/latest-e2e/dflash2-fused-viewcache-b1-nodes-o128-v5.{qdstrm,nsys-rep,sqlite}`.
 - `dnv2003/v100-skinny` is useful as an optimization inventory, but its published
   219.1 tok/s result is a Qwen3.8 mixed-NVFP4/FP8 MTP-k7 route on its 1Cat-vLLM
   1.2.2 fork, not a DFlash2 result and therefore not a direct baseline. Its
