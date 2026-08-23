@@ -121,6 +121,21 @@ All 40 rows retained the exact top-k set; maximum logit absolute difference was
 noncontiguous inputs, more than eight rows, and non-ReLU semantics retain the
 existing fused paged kernel.
 
+The production block-size candidate verifies M=5 rows. Its matched crossover
+gate retained the exact top-k set in all 30 rows and measured:
+
+| Compressed keys | Fused paged Triton | Gather + FP32 cuBLAS | 21-layer projection |
+|---:|---:|---:|---:|
+| 1,024 | 0.03548 ms | 0.01905 ms | -0.345 ms |
+| 2,048 | 0.06881 ms | 0.02196 ms | -0.984 ms |
+| 4,096 | 0.13532 ms | 0.03410 ms | -2.126 ms |
+| 8,192 | 0.26614 ms | 0.05806 ms | -4.370 ms |
+| 16,384 | 0.58173 ms | 0.10066 ms | -10.103 ms |
+| 65,536 | 1.92835 ms | 0.32707 ms | -33.627 ms |
+
+The maximum logit absolute difference was `1.221e-4`. The microbenchmark owner
+released its V100 immediately after writing the artifact.
+
 SM70 DeepSeek V4 graph context buckets now follow raw widths 2K, 4K, 16K, 64K,
 and 128K when the model maximum is 256K. Longer requests retain the generic
 full-context graph. An explicit `VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS`, or an
@@ -139,7 +154,12 @@ growth, while gather-once FP32 cuBLAS addresses the repeated index scan.
 context incrementally. It uses server-reported prompt usage, separates TTFT
 from pure decode, snapshots speculative counters around each request, and gates
 suffix-marker retrieval, replacement characters, token diversity, and repeated
-token runs.
+token runs. When given the TP0 server log it also records interior synchronized
+profiler windows for target forward, target logits, strict rejection/sampling,
+and their summed complete-verifier cost. The verifier row count and acceptance
+positions follow the configured speculative width instead of assuming N=7. A
+zero speculative width records the matched no-speculation long-context speed
+and output-health curve without fabricating verifier counters.
 
 ## Quality Gate
 
@@ -175,5 +195,6 @@ shared runtime environment.
 - private rings: `/data/models/dsv4-verifier-20ms-private-ring-source-gate-r1`
 - indexer crossover: `/data/models/dsv4-verifier-20ms-indexer-crossover-r3`
 - indexer source gate: `/data/models/dsv4-verifier-20ms-indexer-source-gate-r1`
+- M=5 indexer crossover: `/data/models/dsv4-verifier-20ms-indexer-m5-r1`
 - M=5/M=6 grouped verifier: `/data/models/dsv4-verifier-20ms-variable-grouped-r1`
 - rejected TP8 all-reduce: `/data/models/dsv4-verifier-20ms-tp8-ar-screen-r1`

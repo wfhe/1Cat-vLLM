@@ -22,6 +22,9 @@ from urllib.parse import urlparse
 
 from transformers import AutoTokenizer
 
+_PROFILE_INTERVAL_MARKER = "SM70 spec runner profile interval_avg_ms "
+_PROFILE_FIELD_PATTERN = re.compile(r"([a-z_]+)=([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+
 
 def _parse_lengths(raw: str) -> list[int]:
     values = sorted({int(value.strip()) for value in raw.split(",") if value.strip()})
@@ -170,6 +173,91 @@ def _longest_same_token_run(token_ids: list[int]) -> int:
     return longest
 
 
+def _profile_log_offset(profile_log: Path | None) -> int | None:
+    if profile_log is None:
+        return None
+    try:
+        return profile_log.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
+def _read_verifier_profile(
+    profile_log: Path | None,
+    offset: int | None,
+    verifier_rows: int,
+) -> dict[str, Any]:
+    if profile_log is None or offset is None:
+        return {"available": False, "reason": "profile log was not requested"}
+    try:
+        with profile_log.open("rb") as profile_file:
+            profile_file.seek(offset)
+            text = profile_file.read().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return {"available": False, "reason": "profile log does not exist"}
+
+    intervals: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if _PROFILE_INTERVAL_MARKER not in line:
+            continue
+        fields = {
+            key: float(value)
+            for key, value in _PROFILE_FIELD_PATTERN.findall(
+                line.split(_PROFILE_INTERVAL_MARKER, 1)[1]
+            )
+        }
+        if int(fields.get("num_tokens", -1)) != verifier_rows:
+            continue
+        required = ("target_forward", "target_logits", "target_rejection_sample")
+        if any(name not in fields for name in required):
+            continue
+        interval = dict(fields)
+        for name in (
+            "calls",
+            "interval_calls",
+            "interval_spec_steps",
+            "num_tokens",
+            "num_reqs",
+        ):
+            if name in interval:
+                interval[name] = int(interval[name])
+        interval["complete_verifier_ms"] = sum(fields[name] for name in required)
+        intervals.append(interval)
+
+    # The first/last profiler window can straddle prefill or request teardown.
+    # Long sweeps run with a short profile interval and retain only complete
+    # interior windows when enough samples are available.
+    if len(intervals) >= 4:
+        steady_intervals = intervals[1:-1]
+    elif len(intervals) == 3:
+        steady_intervals = intervals[1:]
+    else:
+        steady_intervals = intervals
+    median_names = (
+        "target_forward",
+        "target_logits",
+        "target_rejection_sample",
+        "complete_verifier_ms",
+        "draft_total",
+    )
+    medians = {
+        name: statistics.median(
+            float(interval[name]) for interval in steady_intervals if name in interval
+        )
+        for name in median_names
+        if any(name in interval for interval in steady_intervals)
+    }
+    return {
+        "available": bool(intervals),
+        "profile_log": str(profile_log),
+        "verifier_rows": verifier_rows,
+        "raw_interval_count": len(intervals),
+        "steady_interval_count": len(steady_intervals),
+        "medians_ms": medians,
+        "intervals": intervals,
+    }
+
+
 def _stream_request(
     *,
     host: str,
@@ -287,11 +375,14 @@ def _run_case(
     top_p: float,
     seed: int,
     timeout: int,
+    num_speculative_tokens: int,
+    profile_log: Path | None,
 ) -> dict[str, Any]:
     marker = f"DSV4-CONTEXT-{target_tokens}-OK"
     messages, local_prompt_tokens, unit_count = _fit_messages(
         tokenizer, target_tokens, marker
     )
+    profile_offset = _profile_log_offset(profile_log)
     before = _metrics_snapshot(host, port, timeout)
     result = _stream_request(
         host=host,
@@ -310,8 +401,17 @@ def _run_case(
     accepted = after["accepted"] - before["accepted"]
     accepted_per_position = [
         after["positions"].get(position, 0.0) - before["positions"].get(position, 0.0)
-        for position in range(7)
+        for position in range(num_speculative_tokens)
     ]
+    verifier_profile = (
+        _read_verifier_profile(
+            profile_log,
+            profile_offset,
+            num_speculative_tokens + 1,
+        )
+        if num_speculative_tokens
+        else {"available": False, "reason": "speculative decoding is disabled"}
+    )
     output_text = f"{result['reasoning']}\n{result['content']}"
     output_ids = tokenizer.encode(output_text, add_special_tokens=False)
     completion_tokens = int(result["usage"].get("completion_tokens") or 0)
@@ -347,6 +447,7 @@ def _run_case(
                     for value in accepted_per_position
                 ],
             },
+            "verifier_profile": verifier_profile,
         }
     )
     result["passed"] = bool(
@@ -370,12 +471,22 @@ def _summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         for record in records
         if record["speculative_metrics"]["round_wall_milliseconds"] is not None
     ]
+    verifier_costs = [
+        float(record["verifier_profile"]["medians_ms"]["complete_verifier_ms"])
+        for record in records
+        if record["verifier_profile"].get("medians_ms", {}).get("complete_verifier_ms")
+        is not None
+    ]
     return {
         "cases": len(records),
         "passed": all(record["passed"] for record in records),
         "pure_decode_tps_min": min(speeds) if speeds else None,
         "pure_decode_tps_median": statistics.median(speeds) if speeds else None,
         "round_wall_ms_max": max(round_costs) if round_costs else None,
+        "complete_verifier_ms_median": (
+            statistics.median(verifier_costs) if verifier_costs else None
+        ),
+        "complete_verifier_ms_max": max(verifier_costs) if verifier_costs else None,
     }
 
 
@@ -389,9 +500,14 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260824)
+    parser.add_argument("--num-speculative-tokens", type=int, default=7)
+    parser.add_argument("--profile-log", type=Path)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
+
+    if not 0 <= args.num_speculative_tokens <= 7:
+        raise ValueError("--num-speculative-tokens must be in [0, 7]")
 
     parsed = urlparse(args.base_url)
     if parsed.scheme != "http" or not parsed.hostname:
@@ -418,6 +534,8 @@ def main() -> int:
             top_p=args.top_p,
             seed=args.seed,
             timeout=args.timeout,
+            num_speculative_tokens=args.num_speculative_tokens,
+            profile_log=args.profile_log,
         )
         records.append(record)
         contract = {
@@ -442,6 +560,7 @@ def main() -> int:
                         "pure_decode_tokens_per_second"
                     ],
                     "speculative_metrics": record["speculative_metrics"],
+                    "verifier_profile": record["verifier_profile"],
                     "output_health": record["output_health"],
                     "passed": record["passed"],
                 },
