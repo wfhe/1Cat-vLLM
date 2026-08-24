@@ -3032,6 +3032,32 @@ def sm70_tp4_all_reduce_gemma_rms_norm(
     )
 
 
+def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    normalized_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    reg_input_buffer: int,
+    reg_output_buffer: int,
+    reg_buffer_sz_bytes: int,
+    epsilon: float,
+) -> None:
+    torch.ops._C_custom_ar.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+        fa,
+        inp,
+        residual,
+        weight,
+        normalized_out,
+        residual_out,
+        reg_input_buffer,
+        reg_output_buffer,
+        reg_buffer_sz_bytes,
+        epsilon,
+    )
+
+
 def all_reduce_sum2(
     fa: int,
     inp_a: torch.Tensor,

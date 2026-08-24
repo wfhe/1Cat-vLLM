@@ -238,6 +238,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
   ops.def(
+      "fp8_gemm_sm70_qwen38_prefill_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor _kernel, Tensor _prescaled_factors, int group_size, int k_ld, "
+      "int q_ld) -> ()");
+  ops.impl("fp8_gemm_sm70_qwen38_prefill_out", torch::kCUDA,
+           &fp8_gemm_sm70_qwen38_prefill_out);
+
+  ops.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
       "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
@@ -670,6 +677,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "int reg_buffer, int reg_buffer_sz_bytes, float epsilon) -> ()");
   custom_ar.impl("sm70_tp4_all_reduce_gemma_rms_norm", torch::kCUDA,
                  &sm70_tp4_all_reduce_gemma_rms_norm);
+  custom_ar.def(
+      "sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(int fa, Tensor inp, "
+      "Tensor residual, Tensor weight, Tensor! normalized_out, Tensor! "
+      "residual_out, int reg_input_buffer, int reg_output_buffer, int "
+      "reg_buffer_sz_bytes, float epsilon) -> ()");
+  custom_ar.impl("sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather",
+                 torch::kCUDA,
+                 &sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather);
   custom_ar.def(
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);

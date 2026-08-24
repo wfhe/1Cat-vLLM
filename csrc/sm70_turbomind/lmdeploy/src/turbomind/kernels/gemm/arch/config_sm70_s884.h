@@ -57,7 +57,8 @@ struct Sm70_s884 {
              int  GroupSizeV = 1,
              int  TILE_C_M_  = -1,
              int  TILE_C_N_  = -1,
-             int  GmemLookahead = 1>
+             int  GmemLookahead = 1,
+             bool FullTiles      = false>
     struct Type {
 
         // (TM, TN, TK) = R(MMA_Atom, SmemCopy_Atom)
@@ -68,14 +69,21 @@ struct Sm70_s884 {
 
         using MMA = Tiled_MMA_v2<MMA_Atom, MMA_Map>;
 
+        using IteratorA = std::conditional_t<FullTiles,
+                                             IteratorSm70FullTile<MODE_A, PolicyA>,
+                                             IteratorSm70<MODE_A, PolicyA>>;
+        using IteratorB = std::conditional_t<FullTiles,
+                                             IteratorSm70FullTile<MODE_B, PolicyB>,
+                                             IteratorSm70<MODE_B, PolicyB>>;
+
         using Mainloop = MainloopSm70<MMA,
                                       A,
-                                      IteratorSm70<MODE_A, PolicyA>,
+                                      IteratorA,
                                       TransformA,
                                       U,
                                       GroupSizeU,
                                       B,
-                                      IteratorSm70<MODE_B, PolicyB>,
+                                      IteratorB,
                                       TransformB,
                                       V,
                                       GroupSizeV,
@@ -176,6 +184,18 @@ using Config_E4M3 = Sm70_s884<Operand_A<half>,             // A
                               half,                        // Tc
                               raster_order,
                               group_axis>;
+
+template<Order raster_order, int group_axis = -1>
+using Config_E4M3_Prescaled = Sm70_s884<Operand_A<half>,             // A
+                                        Transform_Default,           // transform A
+                                        VoidOperand,                 // U
+                                        Operand_B_Pack<fp8_e4m3_t>,  // B
+                                        Transform_HMMA_SIMT_B_PrescaledE4M3,
+                                        Operand_V_Pack<uint16_t>,  // pre-scaled V
+                                        kRowMajor,                 // order_C
+                                        half,                      // Tc
+                                        raster_order,
+                                        group_axis>;
 
 template<Order raster_order, int group_axis = -1>
 using Config_F16 = Sm70_s884<Operand_A<half>,       // A

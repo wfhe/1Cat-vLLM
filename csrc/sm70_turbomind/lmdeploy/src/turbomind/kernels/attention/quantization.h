@@ -817,6 +817,7 @@ __device__ inline Array<bfloat16_t, 4> cvt_bf16x4_e4m3(const Array<fp8_e4m3_t, 4
     return (Array<bfloat16_t, 4>&)vo;
 }
 
+template<bool ApplyExponentBias = true>
 __device__ inline Array<half, 4> cvt_f16x4_e4m3(const Array<fp8_e4m3_t, 4>& vi)
 {
     const uint32_t& x = (const uint32_t&)vi;
@@ -837,9 +838,11 @@ __device__ inline Array<half, 4> cvt_f16x4_e4m3(const Array<fp8_e4m3_t, 4>& vi)
     constexpr uint32_t e  = (15U - 7U + 15U) << 10U;
     constexpr uint32_t ee = e << 16U | e;
 
-    PRAGMA_UNROLL
-    for (int i = 0; i < 2; ++i) {
-        asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(vo[i]) : "r"(vo[i]), "r"(ee));
+    if constexpr (ApplyExponentBias) {
+        PRAGMA_UNROLL
+        for (int i = 0; i < 2; ++i) {
+            asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(vo[i]) : "r"(vo[i]), "r"(ee));
+        }
     }
 
     return (Array<half, 4>&)vo;

@@ -244,6 +244,16 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70Mxfp4MoeGroupedM8FastTarget(const Gem
     return std::nullopt;
 }
 
+std::optional<Sm70AwqTp2FastTarget> GetSm70Qwen38Fp8PrefillPrescaledTarget(const GemmDesc& desc)
+{
+    const std::string desc_str = to_string(desc);
+    if (desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x4096x5120_1"
+        || desc_str == "sm70_f16_e4m3k128_f16_tnt_fff_8000x3584x5120_1") {
+        return Sm70AwqTp2FastTarget{desc.n, desc.k, 64, 256, 16, 1, 3, true, "q38_pscale_full"};
+    }
+    return std::nullopt;
+}
+
 bool MatchesSm70AwqTp2FastKernel(const Kernel& kernel, const Sm70AwqTp2FastTarget& target)
 {
     const int3 cta = kernel.cta_tile_size();
@@ -309,12 +319,14 @@ const char* ToString(DispatchPolicy policy)
 {
     if ((policy & DispatchPolicy::kPreserveDefaultSplits)
         || (policy & DispatchPolicy::kPreserveDefaultSplitCount)
-        || (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast)) {
+        || (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast)
+        || (policy & DispatchPolicy::kQwen38Fp8PrefillPrescaled)) {
         static thread_local std::string text;
         auto base =
             static_cast<DispatchPolicy>((int)policy & ~(int)DispatchPolicy::kPreserveDefaultSplits
                                         & ~(int)DispatchPolicy::kPreserveDefaultSplitCount
-                                        & ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast);
+                                        & ~(int)DispatchPolicy::kMxfp4MoeGroupedM8Fast
+                                        & ~(int)DispatchPolicy::kQwen38Fp8PrefillPrescaled);
         text = std::string(ToString(base));
         if (policy & DispatchPolicy::kPreserveDefaultSplits) {
             text += "|preserve_default_splits";
@@ -324,6 +336,9 @@ const char* ToString(DispatchPolicy policy)
         }
         if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
             text += "|mxfp4_moe_grouped_m8_fast";
+        }
+        if (policy & DispatchPolicy::kQwen38Fp8PrefillPrescaled) {
+            text += "|qwen38_fp8_prefill_prescaled";
         }
         return text.c_str();
     }
@@ -363,7 +378,9 @@ void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy, const L
         const int3 mma = spec.kernel->warp_tile_size();
         std::cerr << " kernel=" << spec.kernel->name() << " splits=" << spec.splits << " swizzle=" << spec.swizzle
                   << " cta=" << cta.x << "x" << cta.y << "x" << cta.z << " mma=" << mma.x << "x" << mma.y
-                  << "x" << mma.z << " stages=" << spec.kernel->stages() << " smem=" << spec.kernel->smem_size();
+                  << "x" << mma.z << " stages=" << spec.kernel->stages() << " smem=" << spec.kernel->smem_size()
+                  << " regs=" << spec.kernel->info().attr.numRegs
+                  << " max_ctas=" << spec.kernel->info().max_active_ctas;
     }
     else {
         std::cerr << " kernel=<none>";
@@ -379,7 +396,8 @@ struct Gemm::Impl {
         props_{GetCudaDeviceProps()},
         arch_{props_->major * 100 + props_->minor * 10},
         registry_{props_},
-        cache_{registry_.kernels()}
+        cache_{registry_.kernels()},
+        qwen38_prefill_cache_{registry_.kernels()}
     {
         if (arch_ == 700) {
             // V100 decode is dominated by many tiny GEMM/GEMV problems. A
@@ -416,6 +434,20 @@ struct Gemm::Impl {
         const auto is_feasible = [&](const LaunchSpec& spec) {
             return spec.kernel && spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
         };
+        if (policy & DispatchPolicy::kQwen38Fp8PrefillPrescaled) {
+            if (auto spec = qwen38_prefill_cache_.Find(desc); spec && is_feasible(*spec)) {
+                return *spec;
+            }
+            if (auto fast_target = GetSm70Qwen38Fp8PrefillPrescaledTarget(desc)) {
+                auto specs = Find(ctx, barriers_size, partials_size, 0);
+                if (auto fast_spec = SelectSm70AwqTp2FastSpec(
+                        ctx, specs, *fast_target, barriers_size, partials_size)) {
+                    qwen38_prefill_cache_.Insert(desc, *fast_spec);
+                    return *fast_spec;
+                }
+            }
+            return {};
+        }
         if (policy & DispatchPolicy::kMxfp4MoeGroupedM8Fast) {
             if (auto fast_target = GetSm70Mxfp4MoeGroupedM8FastTarget(desc)) {
                 auto specs = Find(ctx, barriers_size, partials_size, 0);
@@ -604,6 +636,8 @@ struct Gemm::Impl {
     std::optional<Measurer> measurer_;
 
     DispatchCache cache_;
+
+    DispatchCache qwen38_prefill_cache_;
 
     std::mutex dispatch_mutex_;
 };

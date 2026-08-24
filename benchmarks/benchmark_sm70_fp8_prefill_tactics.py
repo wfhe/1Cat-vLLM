@@ -12,22 +12,53 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import statistics
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
 import torch
-import vllm._C  # noqa: F401
 from safetensors import safe_open
 
-from vllm import _sm70_ops as sm70_ops
+import vllm
+
+
+def _load_vllm_c_extension() -> None:
+    if "vllm._C" in sys.modules:
+        vllm._C = sys.modules["vllm._C"]
+        return
+    candidate = os.getenv("VLLM_BENCH_C_EXTENSION")
+    if candidate is None:
+        importlib.import_module("vllm._C")
+        return
+    spec = importlib.util.spec_from_file_location("vllm._C", candidate)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load candidate extension: {candidate}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["vllm._C"] = module
+    vllm._C = module
+    spec.loader.exec_module(module)
+
+
+_load_vllm_c_extension()
+
+from vllm import _sm70_ops as sm70_ops  # noqa: E402
 
 Case = Literal["gdn_qkvz", "full_qkv"]
-Policy = Literal["default", "measure", "resident-f16", "resident-f16-measure"]
+Policy = Literal[
+    "default",
+    "measure",
+    "resident-f16",
+    "resident-f16-measure",
+    "exact-dispatch",
+    "exact-mm",
+    "resident-mm",
+]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -50,7 +81,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--m", type=int, nargs="+", default=[8000])
     parser.add_argument(
         "--policy",
-        choices=("default", "measure", "resident-f16", "resident-f16-measure"),
+        choices=(
+            "default",
+            "measure",
+            "resident-f16",
+            "resident-f16-measure",
+            "exact-dispatch",
+            "exact-mm",
+            "resident-mm",
+        ),
         required=True,
     )
     parser.add_argument(
@@ -63,6 +102,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--trials", type=int, default=7)
     parser.add_argument("--seed", type=int, default=20260823)
+    parser.add_argument("--qwen38-prescaled-prefill", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
     return parser.parse_args()
 
 
@@ -218,6 +259,8 @@ def _run_case(
         raise ValueError(f"Unexpected {case} TP-local shape N={n}, K={k}.")
 
     tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(qweight, scales, 128)
+    if args.qwen38_prescaled_prefill:
+        tm_scales.mul_(256)
     k_ld, q_ld = (int(value) for value in meta.tolist())
     generator = torch.Generator(device=device).manual_seed(args.seed + m)
     inputs = torch.randn(
@@ -225,32 +268,134 @@ def _run_case(
     ).mul_(0.1)
     output = torch.empty((m, n), device=device, dtype=torch.float16)
     resident_bytes = 0
-    if args.policy in ("resident-f16", "resident-f16-measure"):
+    dense_workspace_bytes = 0
+    reference_output = None
+    if args.policy in (
+        "resident-f16",
+        "resident-f16-measure",
+        "exact-dispatch",
+        "exact-mm",
+        "resident-mm",
+    ):
+        reference_output = torch.empty_like(output)
+        if args.qwen38_prescaled_prefill:
+            sm70_ops.fp8_gemm_sm70_qwen38_prefill_out(
+                reference_output,
+                inputs,
+                tm_weight,
+                tm_scales,
+                128,
+                k_ld,
+                q_ld,
+            )
+        else:
+            sm70_ops.fp8_gemm_sm70_out(
+                reference_output,
+                inputs,
+                tm_weight,
+                tm_scales,
+                128,
+                k_ld,
+                q_ld,
+                False,
+            )
         dense_weight = torch.empty((k, n), device=device, dtype=torch.float16)
-        sm70_ops.fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, 128)
-        source_f16_weight = dense_weight.t().contiguous()
-        f16_tm_weight, f16_meta = sm70_ops.sm70_f16_prepare(source_f16_weight)
-        f16_k_ld = int(f16_meta[0].item())
-        resident_bytes = int(f16_tm_weight.numel() * f16_tm_weight.element_size())
+        dense_workspace_bytes = int(dense_weight.numel() * dense_weight.element_size())
+        if args.policy == "exact-dispatch":
 
-        def launch(
-            output: torch.Tensor = output,
-            inputs: torch.Tensor = inputs,
-            f16_tm_weight: torch.Tensor = f16_tm_weight,
-        ) -> None:
-            sm70_ops.sm70_f16_gemm_out(output, inputs, f16_tm_weight, f16_k_ld, False)
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                dense_weight: torch.Tensor = dense_weight,
+                tm_weight: torch.Tensor = tm_weight,
+                tm_scales: torch.Tensor = tm_scales,
+            ) -> None:
+                sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+                    output,
+                    dense_weight.data_ptr(),
+                    inputs,
+                    tm_weight,
+                    tm_scales,
+                    128,
+                    k_ld,
+                    q_ld,
+                    False,
+                    m,
+                )
+
+        elif args.policy == "exact-mm":
+
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                dense_weight: torch.Tensor = dense_weight,
+                tm_weight: torch.Tensor = tm_weight,
+                tm_scales: torch.Tensor = tm_scales,
+            ) -> None:
+                sm70_ops.fp8_sm70_dequantize_out(
+                    dense_weight, tm_weight, tm_scales, 128
+                )
+                torch.mm(inputs, dense_weight, out=output)
+
+        elif args.policy == "resident-mm":
+            sm70_ops.fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, 128)
+            resident_bytes = dense_workspace_bytes
+
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                dense_weight: torch.Tensor = dense_weight,
+            ) -> None:
+                torch.mm(inputs, dense_weight, out=output)
+
+        else:
+            sm70_ops.fp8_sm70_dequantize_out(dense_weight, tm_weight, tm_scales, 128)
+            resident_bytes = dense_workspace_bytes
+            source_f16_weight = dense_weight.t().contiguous()
+            f16_tm_weight, f16_meta = sm70_ops.sm70_f16_prepare(source_f16_weight)
+            f16_k_ld = int(f16_meta[0].item())
+
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                f16_tm_weight: torch.Tensor = f16_tm_weight,
+            ) -> None:
+                sm70_ops.sm70_f16_gemm_out(
+                    output, inputs, f16_tm_weight, f16_k_ld, False
+                )
 
     else:
+        if args.qwen38_prescaled_prefill:
 
-        def launch(
-            output: torch.Tensor = output,
-            inputs: torch.Tensor = inputs,
-            tm_weight: torch.Tensor = tm_weight,
-            tm_scales: torch.Tensor = tm_scales,
-        ) -> None:
-            sm70_ops.fp8_gemm_sm70_out(
-                output, inputs, tm_weight, tm_scales, 128, k_ld, q_ld, False
-            )
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                tm_weight: torch.Tensor = tm_weight,
+                tm_scales: torch.Tensor = tm_scales,
+            ) -> None:
+                sm70_ops.fp8_gemm_sm70_qwen38_prefill_out(
+                    output, inputs, tm_weight, tm_scales, 128, k_ld, q_ld
+                )
+
+        else:
+
+            def launch(
+                output: torch.Tensor = output,
+                inputs: torch.Tensor = inputs,
+                tm_weight: torch.Tensor = tm_weight,
+                tm_scales: torch.Tensor = tm_scales,
+            ) -> None:
+                sm70_ops.fp8_gemm_sm70_out(
+                    output, inputs, tm_weight, tm_scales, 128, k_ld, q_ld, False
+                )
+
+    if args.cuda_graph:
+        launch()
+        torch.accelerator.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        launch = graph.replay
 
     timing = _event_trials(launch, args.warmup, args.iters, args.trials)
     launch()
@@ -265,10 +410,21 @@ def _run_case(
         "tm_meta": {"k_ld": k_ld, "q_ld": q_ld},
         "timing": timing,
         "useful_tflops": float(2 * m * n * k / seconds / 1e12),
+        "dense_workspace_bytes": dense_workspace_bytes,
         "resident_f16_bytes": resident_bytes,
         "output_sha256": _digest(output),
         "output_finite": bool(torch.isfinite(output).all().item()),
     }
+    if reference_output is not None:
+        difference = (output.float() - reference_output.float()).abs()
+        result["reference"] = {
+            "output_sha256": _digest(reference_output),
+            "equal": bool(torch.equal(output, reference_output)),
+            "max_abs_diff": float(difference.max().item()),
+            "mean_abs_diff": float(difference.mean().item()),
+            "equal_elements": int((output == reference_output).sum().item()),
+            "elements": output.numel(),
+        }
     del qweight, scales, tm_weight, tm_scales, inputs, output
     torch.accelerator.empty_cache()
     return result
@@ -310,6 +466,8 @@ def main() -> int:
             "iters": args.iters,
             "trials": args.trials,
             "seed": args.seed,
+            "qwen38_prescaled_prefill": args.qwen38_prescaled_prefill,
+            "cuda_graph": args.cuda_graph,
             "tm_gemm_tune": os.environ.get("TM_GEMM_TUNE"),
             "fast_targets": os.environ.get("VLLM_SM70_AWQ_TP2_FAST_TARGETS"),
             "qwen38_prefill_fast_selector": os.environ.get(

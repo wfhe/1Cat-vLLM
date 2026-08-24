@@ -3560,7 +3560,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         if self.maybe_sm70_qwen_gdn_full_forward:
             layer_name = _encode_layer_name(self.prefix)
@@ -3582,14 +3582,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     layer_name,
                 )
                 return
-        self._forward_method(hidden_states, output)
+        return self._forward_method(hidden_states, output)
 
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
-        self._forward_method(hidden_states, output)
+        return self._forward_method(hidden_states, output)
 
     def _compute_output_projection(
         self,
@@ -3645,18 +3645,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
         proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
-        output[:num_tokens] = proj_out
-        _sm70_gdn_graph_buffer_copy(
-            "proj_output_after_write",
-            layer_name,
-            output[:num_tokens],
-            "proj",
-        )
+        if output is not None:
+            output[:num_tokens] = proj_out
+            _sm70_gdn_graph_buffer_copy(
+                "proj_output_after_write",
+                layer_name,
+                output[:num_tokens],
+                "proj",
+            )
         return proj_out
 
     def forward_hip(
@@ -3715,7 +3716,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         """
         Forward pass with three parts:
@@ -3753,8 +3754,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     layer_name,
                 )
             else:
-                self._output_projection(core_attn_out, z, output, num_tokens)
-            return
+                return self._output_projection(core_attn_out, z, output, num_tokens)
+            return None
 
         if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
             mixed_qkv = torch.empty(
@@ -3805,8 +3806,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     layer_name,
                 )
             else:
-                self._output_projection(core_attn_out, z, output, num_tokens)
-            return
+                return self._output_projection(core_attn_out, z, output, num_tokens)
+            return None
 
         # ============================================================
         # Part 1: Input Projection
@@ -3904,7 +3905,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 layer_name,
             )
         else:
-            self._output_projection(core_attn_out, z, output, num_tokens)
+            return self._output_projection(core_attn_out, z, output, num_tokens)
+        return None
 
     def forward_xpu(
         self,

@@ -156,4 +156,41 @@ struct Transform_HMMA_SIMT_B {
     }
 };
 
+// FP8 scales that have absorbed the E4M3 exponent-bias factor (256) during
+// one-time weight preparation.
+struct Transform_HMMA_SIMT_B_PrescaledE4M3 {
+    template<class F, int Nf, int Mf, int K, class D, int Nd, int Md, class S, int Ns, int Ms, int Ks>
+    __device__ static void
+    apply(Array<F, Nf> (&frag)[K][Mf], int k, Array<D, Nd> (&data)[K][Md], Array<S, Ns> (&stat)[Ks][Ms], int div)
+    {
+        static_assert(std::is_same_v<D, fp8_e4m3_t>);
+        static_assert(std::is_same_v<F, half>);
+        static_assert(std::is_same_v<S, uint16_t>);
+        static_assert(Nf * Mf == Nd * Md);
+        static_assert(Nd % Nf == 0 && Mf % Md == 0);
+        static_assert(Nd % 4 == 0);
+
+        auto& frag_k = reinterpret_cast<Array<F, Nd>(&)[Md]>(frag[k]);
+        auto& stat_k = reinterpret_cast<Array<S, 1>(&)[Ns * Ms]>(stat[k / div]);
+        auto& data_k = data[k];
+
+        PRAGMA_UNROLL
+        for (int m = 0; m < Md; ++m) {
+            Array<F, Nd> tmp;
+            PRAGMA_UNROLL
+            for (int i = 0; i < Nd; i += 4) {
+                auto& src = reinterpret_cast<Array<fp8_e4m3_t, 4>&>(data_k[m][i]);
+                reinterpret_cast<Array<half, 4>&>(tmp[i]) = cvt_f16x4_e4m3<false>(src);
+            }
+            PRAGMA_UNROLL
+            for (int i = 0; i < Nd; i += 2) {
+                auto scale = __ushort_as_half(stat_k[(m * Nd + i) / Nf][0]);
+                tmp[i]     = __hmul(tmp[i], scale);
+                tmp[i + 1] = __hmul(tmp[i + 1], scale);
+            }
+            frag_k[m] = tmp;
+        }
+    }
+};
+
 }  // namespace turbomind::gemm

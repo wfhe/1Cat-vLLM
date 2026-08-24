@@ -174,6 +174,14 @@ void fp8_gemm_sm70_out(torch::Tensor out,
                        int64_t q_ld,
                        bool gated_silu);
 
+void fp8_gemm_sm70_qwen38_prefill_out(torch::Tensor out,
+                                      torch::Tensor _in_feats,
+                                      torch::Tensor _kernel,
+                                      torch::Tensor _prescaled_factors,
+                                      int64_t group_size,
+                                      int64_t k_ld,
+                                      int64_t q_ld);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
@@ -674,6 +682,11 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
     torch::Tensor& weight, torch::Tensor& normalized_out,
     torch::Tensor& residual_out, fptr_t reg_buffer,
     int64_t reg_buffer_sz_bytes, double epsilon);
+void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t reg_input_buffer,
+    fptr_t reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon);
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,

@@ -54,6 +54,9 @@ constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
+constexpr int kSm70LongPrefillSignalBlocks =
+    sm70_tile_runtime::kMaxSignalBlocks;
+constexpr int kSm70LongPrefillMaxTokensPerRank = 2048;
 
 inline int sm70_gemma_rms_norm_threads() {
   const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
@@ -62,6 +65,20 @@ inline int sm70_gemma_rms_norm_threads() {
   return threads == 256 || threads == 512 || threads == 1024
              ? threads
              : kSm70GemmaRmsNormThreads;
+}
+
+inline int sm70_tp4_long_fused_norm_threads() {
+  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS");
+  if (raw == nullptr) return 512;
+  const int threads = std::atoi(raw);
+  return threads == 256 || threads == 512 || threads == 1024 ? threads : 512;
+}
+
+inline int sm70_tp4_long_fused_norm_blocks() {
+  const char* raw = std::getenv("VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS");
+  if (raw == nullptr) return 80;
+  const int blocks = std::atoi(raw);
+  return blocks >= 1 && blocks <= kSm70LongPrefillSignalBlocks ? blocks : 80;
 }
 
 inline bool custom_allreduce_current_device_is_sm70() {
@@ -509,6 +526,129 @@ __global__ void __launch_bounds__(Threads, 1)
   }
 
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+// Benchmark-only SM70 counterpart of NCCL's fused LSA RMSNorm example:
+// reduce-scatter token rows, apply the mixed-dtype Gemma RMSNorm locally, then
+// all-gather by writing the owned normalized rows into every peer output.
+// Each rank launches one CTA per owned token and therefore moves the same
+// asymptotic peer traffic as ring reduce-scatter + all-gather, without
+// materializing an intermediate all-reduce tensor.
+template <int Threads, int ngpus, typename ResidualT, typename WeightT>
+__global__ void __launch_bounds__(Threads, 1)
+    sm70_peer_reduce_scatter_gemma_rms_norm_all_gather(
+        RankData* _input_dp, RankData* _output_dp, RankSignals sg,
+        Signal* self_sg, const ResidualT* __restrict__ residual,
+        const WeightT* __restrict__ weight,
+        float* __restrict__ residual_out, int rank, int num_tokens,
+        float epsilon) {
+  static_assert(ngpus == 4);
+  using H4 = array_t<half, 4>;
+  constexpr int kVarianceVectorWidth = 4;
+  constexpr int kVectorsPerRow =
+      kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
+  constexpr int kVectorsPerThread =
+      (kVectorsPerRow + Threads - 1) / Threads;
+
+  __shared__ float inverse_rms;
+  // Preserve the accepted local GemmaNorm reduction topology. The valid-item
+  // count below limits participation to the threads in this launch.
+  using BlockReduce = cub::BlockReduce<float, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduce_store;
+
+  const int tokens_per_rank = num_tokens / ngpus;
+  const int tid = threadIdx.x;
+  auto input_dp = *_input_dp;
+  auto output_dp = *_output_dp;
+
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  for (int local_row = blockIdx.x; local_row < tokens_per_rank;
+       local_row += gridDim.x) {
+    const int row = rank * tokens_per_rank + local_row;
+    const int vector_row_offset = row * kVectorsPerRow;
+    float4 row_values[kVectorsPerThread];
+    float variance = 0.0f;
+#pragma unroll
+    for (int iter = 0; iter < kVectorsPerThread; ++iter) {
+      const int vector_idx = tid + iter * Threads;
+      if (vector_idx >= kVectorsPerRow) continue;
+      const int global_vector_idx = vector_row_offset + vector_idx;
+      H4 reduced =
+          reinterpret_cast<const H4*>(input_dp.ptrs[0])[global_vector_idx];
+#pragma unroll
+      for (int peer = 1; peer < ngpus; ++peer) {
+        const H4 peer_value =
+            reinterpret_cast<const H4*>(input_dp.ptrs[peer])[global_vector_idx];
+#pragma unroll
+        for (int i = 0; i < kVarianceVectorWidth; ++i) {
+          // NCCL's f16 Sum specialization uses __hadd/__hadd2 at every ring
+          // step. Preserve that FP16 rounding contract instead of accumulating
+          // all four inputs in FP32 and rounding only once.
+          reduced.data[i] = __hadd(reduced.data[i], peer_value.data[i]);
+        }
+      }
+      const float4 residual_value =
+          reinterpret_cast<const float4*>(residual)[global_vector_idx];
+      float4 value;
+      value.x = __half2float(reduced.data[0]) + residual_value.x;
+      value.y = __half2float(reduced.data[1]) + residual_value.y;
+      value.z = __half2float(reduced.data[2]) + residual_value.z;
+      value.w = __half2float(reduced.data[3]) + residual_value.w;
+      row_values[iter] = value;
+      // Keep the public [M, H] residual shape so the compiled model graph does
+      // not change shape.  Only this rank's persistent token shard is valid;
+      // the next fused boundary reads the same shard and ignores other rows.
+      reinterpret_cast<float4*>(residual_out)[global_vector_idx] = value;
+      // Match the accepted local GemmaNorm exactly: each thread accumulates
+      // vector indices tid, tid + Threads, ... in x/y/z/w order before CUB.
+      variance += value.x * value.x;
+      variance += value.y * value.y;
+      variance += value.z * value.z;
+      variance += value.w * value.w;
+    }
+    variance =
+        BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+    if (tid == 0) {
+      inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+    }
+    __syncthreads();
+
+    const float scale = inverse_rms;
+#pragma unroll
+    for (int iter = 0; iter < kVectorsPerThread; ++iter) {
+      const int vector_idx = tid + iter * Threads;
+      if (vector_idx >= kVectorsPerRow) continue;
+      const int column = vector_idx * kVarianceVectorWidth;
+      const float4 value = row_values[iter];
+      H4 normalized_pack;
+      normalized_pack.data[0] = __float2half_rn(
+          value.x * scale *
+          (sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f));
+      normalized_pack.data[1] = __float2half_rn(
+          value.y * scale *
+          (sm70_gemma_rms_norm_to_float(weight[column + 1]) + 1.0f));
+      normalized_pack.data[2] = __float2half_rn(
+          value.z * scale *
+          (sm70_gemma_rms_norm_to_float(weight[column + 2]) + 1.0f));
+      normalized_pack.data[3] = __float2half_rn(
+          value.w * scale *
+          (sm70_gemma_rms_norm_to_float(weight[column + 3]) + 1.0f));
+#pragma unroll
+      for (int peer = 0; peer < ngpus; ++peer) {
+        auto* peer_output =
+            reinterpret_cast<H4*>(const_cast<void*>(output_dp.ptrs[peer]));
+        peer_output[vector_row_offset + vector_idx] = normalized_pack;
+      }
+    }
+    // CUB's temporary storage is reused by the next persistent row.
+    __syncthreads();
+  }
+
+  // The normalized rows are written directly into peer IPC buffers.  Unlike
+  // an ordinary final all-reduce barrier, this barrier must publish those
+  // remote stores before a peer starts its local output copy.
+  barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -1234,6 +1374,56 @@ class CustomAllreduce {
         break;
     }
 #undef VLLM_LAUNCH_SM70_GEMMA_RMS_NORM
+  }
+
+  template <int ngpus, typename ResidualT, typename WeightT>
+  void sm70_reduce_scatter_gemma_rms_norm_all_gather(
+      cudaStream_t stream, half* input, half* shared_output,
+      const ResidualT* residual, const WeightT* weight, float* residual_out,
+      int num_tokens, int hidden_size, float epsilon) {
+    if (world_size_ != ngpus || !fully_connected_ ||
+        !custom_allreduce_current_device_is_sm70()) {
+      throw std::runtime_error(
+          "SM70 long-prefill fused norm requires fully connected TP" +
+          std::to_string(ngpus) + " on SM70.");
+    }
+    if (hidden_size != kSm70GemmaRmsNormHiddenSize ||
+        num_tokens <= 0 || num_tokens % ngpus != 0) {
+      throw std::runtime_error(
+          "SM70 long-prefill fused norm requires a TP-divisible [M, 5120] "
+          "input.");
+    }
+    const int tokens_per_rank = num_tokens / ngpus;
+    if (tokens_per_rank > kSm70LongPrefillMaxTokensPerRank) {
+      throw std::runtime_error(
+          "SM70 long-prefill fused norm exceeds the token-shard capacity.");
+    }
+
+    RankData* input_ptrs =
+        rank_data_for_buffer(stream, input, "long-prefill fused norm input");
+    RankData* output_ptrs = rank_data_for_buffer(
+        stream, shared_output, "long-prefill fused norm output");
+    const int threads = sm70_tp4_long_fused_norm_threads();
+    const int blocks =
+        std::min(tokens_per_rank, sm70_tp4_long_fused_norm_blocks());
+#define VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(THREADS)                     \
+  sm70_peer_reduce_scatter_gemma_rms_norm_all_gather<                     \
+      THREADS, ngpus, ResidualT, WeightT>                                  \
+      <<<blocks, THREADS, 0, stream>>>(                                    \
+          input_ptrs, output_ptrs, sg_, self_sg_, residual, weight,        \
+          residual_out, rank_, num_tokens, epsilon)
+    switch (threads) {
+      case 256:
+        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(256);
+        break;
+      case 1024:
+        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(1024);
+        break;
+      default:
+        VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM(512);
+        break;
+    }
+#undef VLLM_LAUNCH_SM70_TP4_LONG_FUSED_NORM
   }
 
   template <typename T>

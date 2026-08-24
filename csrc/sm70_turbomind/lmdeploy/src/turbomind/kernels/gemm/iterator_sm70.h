@@ -274,4 +274,13 @@ struct IteratorSm70 {
     using Type = GmemIteratorSm70<T, Map, SmemLayout, kPack, kOrder, AlignedC, AlignedS, mode, Policy>;
 };
 
+// Exact-shape kernels may promise that every CTA covers a complete M/N/K tile.
+// Keep ThreadMap's intrinsic bounds (for example the one-row scale tile), but
+// remove runtime edge predicates from otherwise aligned A/B tiles.
+template<Striding mode, class Policy>
+struct IteratorSm70FullTile {
+    template<class T, class Map, class SmemLayout, Pack kPack, Order kOrder, bool, bool>
+    using Type = GmemIteratorSm70<T, Map, SmemLayout, kPack, kOrder, true, true, mode, Policy>;
+};
+
 }  // namespace turbomind::gemm

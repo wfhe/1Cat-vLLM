@@ -4,17 +4,19 @@
 
 namespace vllm::sm70_tile_runtime {
 
-// Keep the default all-reduce block limit unchanged, but allow the
-// TileRT-style MLP down-proj path to publish one flag per TurboMind N tile.
+// Keep the default TileRT/all-reduce block limit unchanged.  The larger signal
+// capacity is reserved for long-prefill collective-fusion experiments that use
+// one cross-rank barrier per owned token.
 constexpr int kMaxBlocks = 64;
+constexpr int kMaxSignalBlocks = 512;
 constexpr int kMaxRanks = 8;
 
 using FlagType = uint32_t;
 
 struct Signal {
-  alignas(128) FlagType start[kMaxBlocks][kMaxRanks];
-  alignas(128) FlagType end[kMaxBlocks][kMaxRanks];
-  alignas(128) FlagType _flag[kMaxBlocks];
+  alignas(128) FlagType start[kMaxSignalBlocks][kMaxRanks];
+  alignas(128) FlagType end[kMaxSignalBlocks][kMaxRanks];
+  alignas(128) FlagType _flag[kMaxSignalBlocks];
 };
 
 struct __align__(16) RankData {

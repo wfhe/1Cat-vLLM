@@ -297,7 +297,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
@@ -363,7 +363,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             conv_state_cache=conv_state_cache,
             ssm_state_cache=ssm_state_cache,
         )
-        self._output_projection(core_attn_out, z, output, num_tokens)
+        return self._output_projection(core_attn_out, z, output, num_tokens)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):

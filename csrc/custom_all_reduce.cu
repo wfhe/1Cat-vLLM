@@ -277,6 +277,82 @@ void sm70_tp4_all_reduce_gemma_rms_norm(
       reg_buffer_sz_bytes, epsilon);
 }
 
+void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t _reg_input_buffer,
+    fptr_t _reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon) {
+  constexpr int64_t kWorldSize = 4;
+  constexpr int64_t kHiddenSize = vllm::kSm70GemmaRmsNormHiddenSize;
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(fa->world_size_, kWorldSize);
+  TORCH_CHECK(fa->fully_connected_);
+  TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK(weight.scalar_type() == at::ScalarType::Half ||
+              weight.scalar_type() == at::ScalarType::Float);
+  TORCH_CHECK_EQ(normalized_out.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(inp.dim(), 2);
+  TORCH_CHECK_EQ(inp.size(1), kHiddenSize);
+  TORCH_CHECK_EQ(inp.size(0) % kWorldSize, 0);
+  TORCH_CHECK_LE(inp.size(0) / kWorldSize,
+                 vllm::kSm70LongPrefillMaxTokensPerRank);
+  TORCH_CHECK(residual.sizes() == inp.sizes());
+  TORCH_CHECK(normalized_out.sizes() == inp.sizes());
+  TORCH_CHECK(residual_out.sizes() == inp.sizes());
+  TORCH_CHECK_EQ(weight.dim(), 1);
+  TORCH_CHECK_EQ(weight.numel(), kHiddenSize);
+  TORCH_CHECK_EQ(residual.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(weight.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(normalized_out.get_device(), inp.get_device());
+  TORCH_CHECK_EQ(residual_out.get_device(), inp.get_device());
+  TORCH_CHECK(inp.is_contiguous());
+  TORCH_CHECK(residual.is_contiguous());
+  TORCH_CHECK(weight.is_contiguous());
+  TORCH_CHECK(normalized_out.is_contiguous());
+  TORCH_CHECK(residual_out.is_contiguous());
+
+  auto* reg_input_buffer = reinterpret_cast<void*>(_reg_input_buffer);
+  auto* reg_output_buffer = reinterpret_cast<void*>(_reg_output_buffer);
+  const int64_t input_size = inp.numel() * inp.element_size();
+  TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+  if (reg_input_buffer != nullptr) {
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_input_buffer, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_input_buffer = inp.data_ptr();
+  }
+  if (reg_output_buffer == nullptr) {
+    reg_output_buffer = normalized_out.data_ptr();
+  }
+
+  auto* input_ptr = reinterpret_cast<half*>(reg_input_buffer);
+  auto* shared_output_ptr = reinterpret_cast<half*>(reg_output_buffer);
+  auto* residual_ptr = reinterpret_cast<const float*>(residual.data_ptr());
+  auto* residual_out_ptr = reinterpret_cast<float*>(residual_out.data_ptr());
+  const int num_tokens = static_cast<int>(inp.size(0));
+  const float epsilon_f = static_cast<float>(epsilon);
+  if (weight.scalar_type() == at::ScalarType::Float) {
+    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, float>(
+        stream, input_ptr, shared_output_ptr, residual_ptr,
+        reinterpret_cast<const float*>(weight.data_ptr()), residual_out_ptr,
+        num_tokens, kHiddenSize, epsilon_f);
+  } else {
+    fa->sm70_reduce_scatter_gemma_rms_norm_all_gather<4, float, half>(
+        stream, input_ptr, shared_output_ptr, residual_ptr,
+        reinterpret_cast<const half*>(weight.data_ptr()), residual_out_ptr,
+        num_tokens, kHiddenSize, epsilon_f);
+  }
+  if (_reg_output_buffer != 0) {
+    AT_CUDA_CHECK(cudaMemcpyAsync(normalized_out.data_ptr(), reg_output_buffer,
+                                  input_size, cudaMemcpyDeviceToDevice, stream));
+  }
+}
+
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
