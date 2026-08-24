@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -80,6 +81,7 @@ from vllm.v1.worker.gpu.input_batch import (
     post_update_pool,
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
+    sampled_tokens_oob_sentinel,
 )
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
@@ -143,6 +145,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.output_copy_stream = torch.cuda.Stream(self.device)
+
+        # SM70 DFlash2 L1 defensive floor (P2b): sentinel state for the
+        # out-of-range sampler token id check (lazy-allocated device flag
+        # buffer + step counter).
+        self._sentinel_event_buf: torch.Tensor | None = None
+        self._sentinel_step = 0
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1055,6 +1063,67 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return sampler_output, num_sampled, num_rejected
 
+    def _sentinel_check_sampler_output(
+        self,
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        """SM70 DFlash2 L1 defensive floor (P2b).
+
+        Clamps out-of-range (< 0 or >= vocab_size) sampler token ids in
+        place so they cannot reach last_sampled / all_token_ids /
+        output_bin_counts / draft anchors. An out-of-range bonus token
+        would otherwise be fed back through the embedding and lock the
+        request into a constant-V garbage loop (Exp A2, 2026-08-22).
+
+        Per-step cost is one small kernel launch plus a 4-byte flag
+        readback (a single D2H sync, negligible in sync scheduling); the
+        full trigger geometry is materialized only on OOB steps.
+        """
+        self._sentinel_step += 1
+        if self._sentinel_event_buf is None:
+            self._sentinel_event_buf = torch.zeros(
+                1 + 3 * 8,
+                dtype=torch.int32,
+                device=sampled_token_ids.device,
+            )
+        n_oob = sampled_tokens_oob_sentinel(
+            sampled_token_ids,
+            num_sampled,
+            self.vocab_size,
+            self._sentinel_event_buf,
+        )
+        if n_oob == 0:
+            return
+        ev = self._sentinel_event_buf
+        records = [
+            (
+                int(ev[1 + 3 * k].item()),
+                int(ev[2 + 3 * k].item()),
+                int(ev[3 + 3 * k].item()),
+            )
+            for k in range(min(n_oob, 8))
+        ]
+        nr = input_batch.num_reqs
+        logger.warning(
+            "[SM70-DFlash2-sentinel] step=%d: %d out-of-range sampler "
+            "token(s) clamped to [0, %d); oob(value,req_idx,slot)=%s; "
+            "num_sampled=%s; num_rejected=%s; seq_lens=%s; "
+            "num_scheduled=%s; query_start_loc=%s; idx_mapping=%s",
+            self._sentinel_step,
+            n_oob,
+            self.vocab_size,
+            records,
+            num_sampled[:nr].tolist(),
+            num_rejected[:nr].tolist(),
+            input_batch.seq_lens[:nr].tolist(),
+            input_batch.num_scheduled_tokens.tolist(),
+            input_batch.query_start_loc_np.tolist(),
+            input_batch.idx_mapping_np.tolist(),
+        )
+
     def postprocess(
         self,
         input_batch: InputBatch,
@@ -1348,6 +1417,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        # SM70 DFlash2 L1 defensive floor (P2b): clamp out-of-range sampler
+        # token ids in place before any downstream consumer (PP broadcast,
+        # AsyncOutput D2H copy, post_update -> last_sampled / all_token_ids /
+        # output_bin_counts, speculator anchor). Gated on the speculator so
+        # plain non-spec runs pay no extra cost. (This method has no
+        # dummy_run flag — warmup samples run with dummy hidden states and
+        # the sentinel is a no-op on them.)
+        if (
+            self.speculator is not None
+            and envs.VLLM_SM70_DFLASH2_SAMPLER_SENTINEL
+            and sampler_output.sampled_token_ids is not None
+        ):
+            self._sentinel_check_sampler_output(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch,
+            )
 
         if self.use_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

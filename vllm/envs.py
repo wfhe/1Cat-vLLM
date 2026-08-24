@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
     VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS: int = 8
     VLLM_SM70_AUX_KERNEL_WARMUP: bool = True
+    VLLM_SM70_DFLASH2_SAMPLER_SENTINEL: bool = True
     VLLM_SM70_GEMM_LUT_PATH: str | None = None
     VLLM_SM70_AWQ_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_FP8_DENSE_TUNE_MAX_M: int = 16
@@ -1568,6 +1569,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # individual accepted formats such as NVFP4/MXFP4 are gated below.
     "VLLM_SM70_GPTQ_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_GPTQ_TURBOMIND", "0"))
+    ),
+    # SM70 DFlash2 L1 defensive floor: clamp out-of-range sampler token ids
+    # in place before they reach last_sampled / all_token_ids /
+    # output_bin_counts / speculator anchors, and log the trigger geometry.
+    # Opt out with VLLM_SM70_DFLASH2_SAMPLER_SENTINEL=0.
+    "VLLM_SM70_DFLASH2_SAMPLER_SENTINEL": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_SAMPLER_SENTINEL", "1"))
     ),
     "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))

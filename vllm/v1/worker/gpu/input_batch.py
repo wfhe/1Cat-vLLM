@@ -520,6 +520,71 @@ def post_update(
 
 
 @triton.jit
+def _sampled_tokens_oob_sentinel_kernel(
+    sampled_tokens_ptr,
+    sampled_tokens_stride,
+    num_sampled_ptr,
+    event_ptr,
+    vocab_size,
+    num_reqs,
+    max_sample_len,
+):
+    """Clamp out-of-range sampled token ids in place and record them.
+
+    Only the first num_sampled[req] entries of each row are valid.
+    Event buffer layout (int32): [total_oob, (value, req_id, slot), ...]
+    with at most 8 records.
+    """
+    total_oob = 0
+    for req in range(num_reqs):
+        n = tl.load(num_sampled_ptr + req)
+        for i in range(max_sample_len):
+            if i < n:
+                v = tl.load(sampled_tokens_ptr + req * sampled_tokens_stride + i)
+                if v < 0 or v >= vocab_size:
+                    if total_oob < 8:
+                        tl.store(event_ptr + 1 + 3 * total_oob, v.to(tl.int32))
+                        tl.store(event_ptr + 2 + 3 * total_oob, req)
+                        tl.store(event_ptr + 3 + 3 * total_oob, i)
+                    total_oob += 1
+                    tl.store(
+                        sampled_tokens_ptr + req * sampled_tokens_stride + i,
+                        tl.where(v < 0, 0, vocab_size - 1),
+                    )
+    tl.store(event_ptr, total_oob)
+
+
+def sampled_tokens_oob_sentinel(
+    # [num_reqs, max_sample_len]
+    sampled_tokens: torch.Tensor,
+    # [num_reqs]
+    num_sampled: torch.Tensor,
+    vocab_size: int,
+    # [1 + 3 * 8] int32
+    event: torch.Tensor,
+) -> int:
+    """Clamp out-of-range ids in ``sampled_tokens`` in place.
+
+    Returns the number of clamped entries; the first 8 (value, req_id,
+    slot) records are written to ``event``.
+    """
+    num_reqs = sampled_tokens.shape[0]
+    if num_reqs == 0:
+        return 0
+    _sampled_tokens_oob_sentinel_kernel[(1,)](
+        sampled_tokens,
+        sampled_tokens.stride(0),
+        num_sampled,
+        event,
+        vocab_size,
+        num_reqs,
+        sampled_tokens.shape[1],
+        num_warps=1,
+    )
+    return int(event[0].item())
+
+
+@triton.jit
 def _post_update_pool_kernel(
     idx_mapping_ptr,
     num_computed_tokens_ptr,
