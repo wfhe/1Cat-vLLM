@@ -41746,6 +41746,7 @@ Interpretation:
 - Full contract, route map, staged results, profile table, numerical evidence,
   rejected paths, rollback controls, and artifacts are in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
 ## 2026-08-24 Qwen3.8-27B-NVFP4 TP4 no-MTP 80 tok/s acceptance
 
 - The frozen input-1024/output-256 TP4 contract now passes the requested
