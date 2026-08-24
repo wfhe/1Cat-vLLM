@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+import os
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -814,6 +817,169 @@ def dflash2_sparse_topk_rejection_sample(
         num_warps=1,
     )
     return sampled, num_sampled
+_FORENSIC_LOGITS_LOG = logging.getLogger(__name__)
+
+
+def _forensic_logits_dump(
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    target_logits: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    resampled_local_argmax: torch.Tensor | None,
+    resampled_local_max: torch.Tensor | None,
+    vocab_size: int,
+    num_speculative_steps: int,
+) -> None:
+    """P2b-L2 forensic: when the rejection sampler emits an out-of-range
+    token, dump the sampled rows of target_logits + sampler geometry + the
+    raw sampled buffer.
+
+    Decisive check for the conc>=2 OOB bonus token (id == vocab_size):
+      - target_logits row normal (width V, no NaN/Inf, argmax < V) but the
+        sampled slot == V  =>  the V sentinel is being written/read into
+        `sampled` directly (input-anchor passthrough or buffer overlap).
+      - row contains NaN/Inf or has an abnormal width  =>  the forward /
+        logits producer is corrupted (OOB anchor embedding lookup).
+
+    Only the *valid* sampled slots (0..num_sampled[req]-1) are checked; the
+    rest of the `new_empty` buffer is uninitialized garbage. Throttled to the
+    first 8 OOB steps.
+    """
+    import json
+
+    try:
+        import numpy as np
+    except Exception:
+        return
+
+    try:
+        spec = sampled.shape[1]
+        slot_idx = torch.arange(spec, device=sampled.device).unsqueeze(0)
+        valid = slot_idx < num_sampled.to(torch.int64).unsqueeze(1)
+        oob = ((sampled >= vocab_size) | (sampled < 0)) & valid
+        if not bool(oob.any()):
+            return
+
+        if _forensic_logits_dump._count is None:
+            _forensic_logits_dump._count = 0
+        _forensic_logits_dump._count += 1
+        if _forensic_logits_dump._count > 8:
+            return
+
+        pid = os.getpid()
+        path = f"/tmp/forensic-logits-{pid}.jsonl"
+        cu = cu_num_logits.cpu().tolist()
+        oob_reqs = oob.any(dim=1).nonzero().flatten().cpu().tolist()
+
+        rec = {
+            "step_count": _forensic_logits_dump._count,
+            "vocab_size": vocab_size,
+            "num_logits": int(target_logits.shape[0]),
+            "logits_width": int(target_logits.shape[1]),
+            "logits_dtype": str(target_logits.dtype),
+            "num_reqs": int(cu_num_logits.shape[0] - 1),
+            "num_speculative_steps": num_speculative_steps,
+            "cu_num_logits": cu,
+            "num_sampled": num_sampled.cpu().tolist(),
+            "idx_mapping": idx_mapping.cpu().tolist(),
+            "expanded_local_pos": expanded_local_pos.cpu().tolist(),
+            "expanded_idx_mapping": expanded_idx_mapping.cpu().tolist(),
+            "pos": pos.cpu().tolist(),
+            "draft_sampled": draft_sampled.cpu().tolist(),
+            "oob_reqs": oob_reqs,
+            "oob_slot_mask": oob.cpu().tolist(),
+            "sampled": sampled.cpu().tolist(),
+        }
+
+        # Per-block resample stats (the exact arrays the insert kernel does
+        # its cross-block argmax over). Decisive for case (a): if the winner
+        # block's local argmax is in-range but `sampled` holds V, the value
+        # was written into `sampled` by something other than the kernel.
+        if (
+            resampled_local_argmax is not None
+            and resampled_local_max is not None
+        ):
+            rl_argmax = resampled_local_argmax.cpu().tolist()
+            rl_max = resampled_local_max.cpu().tolist()
+            block_stats = {}
+            for req in oob_reqs:
+                mrow = rl_max[req]
+                arow = rl_argmax[req]
+                # JSON-safe max row (non-finite -> strings)
+                msafe = [
+                    x if isinstance(x, (int, float)) and x == x and abs(x) != float("inf")
+                    else ("NaN" if (isinstance(x, float) and x != x) else
+                          ("inf" if x == float("inf") else "-inf"))
+                    for x in mrow
+                ]
+                winner = None
+                best = None
+                for bi, x in enumerate(mrow):
+                    if isinstance(x, float) and x != x:
+                        continue  # NaN can never win a cross-block argmax
+                    if best is None or x > best:
+                        best = x
+                        winner = bi
+                block_stats[str(req)] = {
+                    "resampled_local_max": msafe,
+                    "resampled_local_argmax": arow,
+                    "python_winner_block": winner,
+                    "python_winner_value": msafe[winner] if winner is not None else None,
+                    "winner_local_argmax": (
+                        arow[winner] if winner is not None else None
+                    ),
+                }
+            rec["resample_block_stats"] = block_stats
+
+        rows = []
+        for req in oob_reqs:
+            r0, r1 = cu[req], cu[req + 1]
+            for ri in range(r0, r1):
+                v = target_logits[ri].float().cpu()
+                fin = torch.isfinite(v)
+                row_rec = {
+                    "req": req,
+                    "logit_row": int(ri),
+                    "width": int(v.numel()),
+                    "n_finite": int(fin.sum()),
+                    "n_nan": int(torch.isnan(v).sum()),
+                    "n_posinf": int(torch.isposinf(v).sum()),
+                    "n_neginf": int(torch.isneginf(v).sum()),
+                }
+                if v.numel():
+                    row_rec["max"] = float(v.max())
+                    row_rec["min"] = float(v.min())
+                    row_rec["argmax"] = int(v.argmax())
+                    row_rec["first8"] = v[:8].tolist()
+                    row_rec["last8"] = v[-8:].tolist()
+                try:
+                    np.save(
+                        f"/tmp/forensic-logits-{pid}-r{req}-{ri}.npy", v.numpy()
+                    )
+                except Exception:
+                    pass
+                rows.append(row_rec)
+        rec["logits_rows"] = rows
+
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        _FORENSIC_LOGITS_LOG.info(
+            "LOGITS-DUMP step_count=%d oob_reqs=%s rows=%d -> %s",
+            _forensic_logits_dump._count, oob_reqs, len(rows), path,
+        )
+    except Exception as e:  # never let the forensic dump kill the engine
+        try:
+            _FORENSIC_LOGITS_LOG.warning("LOGITS-DUMP failed: %r", e)
+        except Exception:
+            pass
+
+
+_forensic_logits_dump._count = None
 
 
 def rejection_sample(
@@ -993,4 +1159,27 @@ def rejection_sample(
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
     )
+
+    # P2b-L2 forensic: when an out-of-range token is emitted, dump the
+    # sampled rows of target_logits + geometry + the raw sampled buffer.
+    # Off by default (VLLM_SM70_DFLASH2_LOGITS_DUMP=1).
+    if os.environ.get("VLLM_SM70_DFLASH2_LOGITS_DUMP") == "1":
+        try:
+            _forensic_logits_dump(
+                sampled,
+                num_sampled,
+                target_logits,
+                cu_num_logits,
+                expanded_idx_mapping,
+                expanded_local_pos,
+                pos,
+                idx_mapping,
+                draft_sampled,
+                resampled_local_argmax,
+                resampled_local_max,
+                vocab_size,
+                num_speculative_steps,
+            )
+        except Exception:
+            pass
     return sampled, num_sampled

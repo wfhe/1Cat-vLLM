@@ -288,6 +288,7 @@ class CandidateSelector(nn.Module):
     ) -> None:
         super().__init__()
         self.top_k = top_k
+        self.vocab_size = vocab_size
         self.predecessor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
         )
@@ -311,6 +312,17 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
+        # Defense in depth (SM70 conc>=2 crash): out-of-range ids in the
+        # anchor/candidate buffers (garbage from stale in-graph reads) make
+        # the codebook gather fault with a device-side assert and kill the
+        # engine. Clamp into the kernel's legal domain: -1 is the legal
+        # invalid-draft sentinel (the kernel wraps it to row vocab-1), and
+        # values beyond [-vocab, vocab-1] are garbage; mapping them to the
+        # boundary rows keeps every gather index in range while the affected
+        # draft slots score as garbage and get rejected as usual.
+        v = self.vocab_size
+        candidate_ids = candidate_ids.clamp(min=-v, max=v - 1)
+        anchor_token_ids = anchor_token_ids.clamp(min=-v, max=v - 1)
         hidden = self.hidden_projection(hidden_states)
         return _score_edges(
             self.predecessor_codebook,

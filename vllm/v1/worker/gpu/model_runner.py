@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -151,6 +152,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # buffer + step counter).
         self._sentinel_event_buf: torch.Tensor | None = None
         self._sentinel_step = 0
+        # P2b-L3 (forensic): per-layer input-NaN probe state (lazy).
+        self._l3_nan_flags: torch.Tensor | None = None
+        self._l3_layer_types: list[str] | None = None
+        self._l3_probe_tried = False
+        self._l3_layer_flush_done = False
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -488,6 +494,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+        # GDN-OOB root fix (SM70 hybrid mamba-align attention): reused
+        # full-attention KV blocks are never re-zeroed on free/reuse, so the
+        # unwritten "future" region [seq_len, block_size) of each request's
+        # last (partial) block keeps stale residue from previous occupants.
+        # The SM70 attention kernel reads that region, and stale NaN survives
+        # arithmetic attention masking (0*NaN=NaN), poisoning every hidden
+        # row of the batch -> all-NaN logits -> exactly-V OOB sample.  Zero
+        # the tail of every scheduled request's last block each step; see
+        # _zero_stale_kv_tail, called from prepare_attn.
+        # The full-attn layers are spread across MULTIPLE non-Mamba KV groups
+        # (each group = one block table + one storage block size).  The
+        # stale-tail NaN can live in ANY full-attn layer's KV, so every
+        # non-Mamba group's layers must be zeroed, each with its OWN block
+        # table (zeroing a group's KV with another group's block ids would
+        # clobber valid data).  Each entry: (group_index, block_size, kvs).
+        self._fa_groups: list[tuple[int, int, list[torch.Tensor]]] = []
+        for _gi, _group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(_group.kv_cache_spec, MambaSpec):
+                continue
+            # Only valid when the DST block table's block ids index the
+            # storage blocks 1:1 (kernel block size == storage block size);
+            # otherwise the tail computation would use the wrong granularity.
+            if self.block_tables.blocks_per_kv_block[_gi] != 1:
+                continue
+            _bs = _group.kv_cache_spec.block_size
+            _kvs: list[torch.Tensor] = []
+            for _layer_name in _group.layer_names:
+                _t = kv_caches_dict.get(_layer_name)
+                if (
+                    _t is not None
+                    and torch.is_tensor(_t)
+                    and _t.ndim == 5
+                    and _t.shape[1] == 2
+                    and _t.shape[2] == _bs
+                ):
+                    _kvs.append(_t)
+            if _kvs:
+                self._fa_groups.append((_gi, _bs, _kvs))
+        if self._fa_groups:
+            logger.info(
+                "GDN-OOB root fix: %d non-mamba KV groups -> %s",
+                len(self._fa_groups),
+                [(gi, bs, len(kvs)) for (gi, bs, kvs) in self._fa_groups],
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Precompute metadata used to clear newly allocated cache blocks."""
@@ -995,7 +1046,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
+        # GDN-OOB root fix: zero the stale unwritten tail of each request's
+        # last full-attn KV block before the attention kernel reads it.
+        # Eager op (not captured into CUDA graphs); no-op on standard
+        # (non-hybrid) deployments without a large-block full-attn group.
+        self._zero_stale_kv_tail(input_batch)
         return block_tables, slot_mappings
+
+    def _zero_stale_kv_tail(self, input_batch: InputBatch) -> None:
+        # Reused full-attn KV blocks keep stale residue (potentially NaN)
+        # in the unwritten region [seq_len, block_size) of the request's
+        # last block.  This step's writes fill exactly [0, seq_len) of the
+        # request's blocks (seq_len is the post-step length from
+        # input_batch.seq_lens), so zeroing [seq_len % block_size,
+        # block_size) of the last block can never touch a slot holding
+        # valid data, and a full last block (seq_len % block_size == 0) is
+        # left entirely alone — which is also why prefix-cached (always
+        # full) blocks are never clobbered.
+        if not self._fa_groups:
+            return
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return
+        # batch position -> request state index.
+        idx_mapping_np = input_batch.idx_mapping_np
+        seq_lens_cpu = input_batch.seq_lens[:num_reqs].cpu()
+        for fa_group, block_size, kvs in self._fa_groups:
+            # Per-request-state block counts (CPU), gathered into batch order
+            # for THIS group's block table.
+            nb_np_all = self.block_tables.num_blocks.np[fa_group]
+            nb_per_batch = np.fromiter(
+                (int(nb_np_all[int(i)]) for i in idx_mapping_np[:num_reqs]),
+                dtype=np.int64,
+                count=num_reqs,
+            )
+            bt = self.block_tables.input_block_tables[fa_group]
+            idx = torch.arange(num_reqs, device=bt.device)
+            nb_gpu = torch.as_tensor(nb_per_batch, device=bt.device)
+            last_block_ids = bt[:num_reqs][idx, nb_gpu - 1].cpu()
+            for b in range(num_reqs):
+                nb = int(nb_per_batch[b])
+                if nb <= 0:
+                    continue
+                tail_start = int(seq_lens_cpu[b]) % block_size
+                if tail_start == 0:
+                    # Last block is full (or empty); nothing stale to zero.
+                    continue
+                last_block = int(last_block_ids[b])
+                if last_block < 0:
+                    continue
+                # kv layout: [num_blocks, K/V, block_size, heads, dim].  Zero
+                # the stale tail in every layer's KV tensor of this group
+                # (they share this group's block table).
+                for kv in kvs:
+                    kv[last_block, :, tail_start:, :, :].zero_()
 
     def prepare_dummy_attn(
         self, input_batch: InputBatch
@@ -1063,12 +1167,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return sampler_output, num_sampled, num_rejected
 
+    def _l3_maybe_register_layer_nan_probe(self) -> None:
+        """P2b-L3 (forensic, working-tree-only): register per-layer input
+        NaN probes on the target model's decoder layers.
+
+        Each probe records, GPU->GPU with no sync, whether the layer's input
+        hidden state contains any NaN. The sentinel reads the flags back once
+        per OOB step and reports the first NaN-producing layer, which
+        localizes the NaN origin (embedding vs GDN state vs KV vs MoE).
+        """
+        if self._l3_probe_tried:
+            return
+        self._l3_probe_tried = True
+        if os.getenv("VLLM_SM70_LAYER_NAN_TRACE") != "1":
+            return
+        model = self.model
+        lm = getattr(model, "language_model", model)
+        inner = getattr(lm, "model", lm)
+        layers = getattr(inner, "layers", None)
+        if layers is None:
+            logger.warning(
+                "[SM70-DFlash2-L3] per-layer NaN probe: could not locate "
+                "target model layers"
+            )
+            return
+        n = len(layers)
+        flags = torch.zeros(n, dtype=torch.bool, device=self.device)
+        types = [str(getattr(l, "layer_type", "?")) for l in layers]
+
+        def make_hook(idx: int):
+            def hook(module, inp, out):
+                h = inp[0] if isinstance(inp, (tuple, list)) else inp
+                if isinstance(h, dict):
+                    # Decoder layers are called with kwargs
+                    # (positions=..., hidden_states=..., residual=...): the
+                    # hook sees a single positional dict.
+                    h = h.get("hidden_states")
+                if isinstance(h, torch.Tensor):
+                    flags[idx] = h.isnan().any()
+
+            return hook
+
+        for i, layer in enumerate(layers):
+            layer.register_forward_hook(make_hook(i))
+        self._l3_nan_flags = flags
+        self._l3_layer_types = types
+        logger.info(
+            "[SM70-DFlash2-L3] registered per-layer input-NaN probes on %d "
+            "target layers",
+            n,
+        )
+
     def _sentinel_check_sampler_output(
         self,
         sampled_token_ids: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         input_batch: InputBatch,
+        hidden_states: torch.Tensor | None = None,
+        attn_metadata: dict | None = None,
     ) -> None:
         """SM70 DFlash2 L1 defensive floor (P2b).
 
@@ -1083,6 +1240,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         full trigger geometry is materialized only on OOB steps.
         """
         self._sentinel_step += 1
+        self._l3_maybe_register_layer_nan_probe()
         if self._sentinel_event_buf is None:
             self._sentinel_event_buf = torch.zeros(
                 1 + 3 * 8,
@@ -1123,6 +1281,343 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc_np.tolist(),
             input_batch.idx_mapping_np.tolist(),
         )
+
+        # P2b-L3 (forensic, working-tree-only): NaN origin hunt.
+        # 1) Per-row NaN counts of the final hidden states (lm_head input):
+        #    distinguishes "hidden already NaN" (state/layer source) from
+        #    "hidden clean but logits NaN" (lm_head/final-norm source).
+        if hidden_states is not None:
+            try:
+                hs = hidden_states.isnan().sum(dim=1).tolist()
+                logger.warning(
+                    "[SM70-DFlash2-L3] step=%d: per-row NaN counts in "
+                    "final hidden states (lm_head input): %s",
+                    self._sentinel_step,
+                    hs,
+                )
+            except Exception as exc:
+                logger.warning("[SM70-DFlash2-L3] hidden NaN check failed: %r", exc)
+
+        # 2) Per-layer input-NaN bisection: which layer's input is already
+        #    NaN? The first such layer localizes the origin (its predecessor,
+        #    or the embedding for layer 0).
+        if self._l3_nan_flags is not None:
+            try:
+                fl = self._l3_nan_flags.cpu().tolist()
+                nan_layers = [i for i, f in enumerate(fl) if f]
+                first = nan_layers[0] if nan_layers else -1
+                logger.warning(
+                    "[SM70-DFlash2-L3] step=%d: %d/%d layer input(s) NaN; "
+                    "first=layer %d (%s); nan_layers=%s",
+                    self._sentinel_step,
+                    len(nan_layers),
+                    len(fl),
+                    first,
+                    (self._l3_layer_types or [])[first] if first >= 0 else "-",
+                    nan_layers,
+                )
+            except Exception as exc:
+                logger.warning("[SM70-DFlash2-L3] layer flag read failed: %r", exc)
+
+        # 3) Root-trigger capture (first OOB step only): flush the persistent
+        #    per-layer graph buffers (filled during this same forward when
+        #    VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS=1) so the exact layer
+        #    tensors of the trigger step are on disk.
+        if (
+            not getattr(self, "_l3_layer_flush_done", False)
+            and os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+        ):
+            self._l3_layer_flush_done = True
+            try:
+                from vllm.model_executor.models.qwen3_next import (
+                    dump_sm70_qwen_layer_graph_buffers,
+                )
+
+                dump_sm70_qwen_layer_graph_buffers(self._sentinel_step, "oob")
+                logger.info(
+                    "[SM70-DFlash2-L3] flushed per-layer graph buffers for "
+                    "step %d (root trigger) to %s",
+                    self._sentinel_step,
+                    os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR"),
+                )
+            except Exception as exc:
+                logger.warning("[SM70-DFlash2-L3] layer flush failed: %r", exc)
+
+        # 4) Root-trigger KV-cache capture (first OOB step only): dump the
+        #    block table, this step's slot mappings, and the physical KV
+        #    blocks referenced by every request at the first NaN layer.
+        #    Discriminates "block never written (slot/table bug)" vs
+        #    "attention kernel read outside the request's block range".
+        if os.getenv("VLLM_SM70_LAYER_NAN_TRACE") == "1" and not getattr(
+            self, "_l3_kv_dump_done", False
+        ):
+            self._l3_kv_dump_done = True
+            self._l3_dump_kv_blocks(input_batch, attn_metadata)
+
+    def _l3_dump_kv_blocks(
+        self, input_batch: InputBatch, attn_metadata: dict | None
+    ) -> None:
+        """Forensic (working-tree-only) KV-cache dump at the root trigger.
+
+        L3c: KV tensor comes from self.kv_caches (layer-index order). In this
+        hybrid model GDN/linear-attn layers occupy the low indices and are
+        stored as lists (conv_state, ssm_state); full-attention layers are the
+        first 5D fused [num_blocks, 2, block_size, heads, head_dim] tensors.
+        Per-slot NaN map + slot_mapping vs block-table cross-check are the
+        decisive evidence for the write-slot vs read-slot mismatch hypothesis.
+        """
+        try:
+            kv_list = getattr(self, "kv_caches", None)
+            if not kv_list:
+                logger.warning(
+                    "[SM70-DFlash2-L3] kv dump: self.kv_caches is empty"
+                )
+                return
+            # Find the first full-attention KV tensor: a 5D tensor with a
+            # fused K/V dim (shape[1] == 2). GDN layers are lists or tensors
+            # without that signature, so skip them.
+            kv = None
+            kv_kind = []
+            for li, entry in enumerate(kv_list):
+                cands = entry if isinstance(entry, (list, tuple)) else [entry]
+                for c in cands:
+                    if not isinstance(c, torch.Tensor):
+                        continue
+                    sh = tuple(int(s) for s in c.shape)
+                    kv_kind.append(f"{li}:{sh}")
+                    if len(sh) == 5 and sh[1] == 2 and sh[4] in (64, 128, 256):
+                        kv = c.detach()
+                        break
+                if kv is not None:
+                    break
+            if kv is None:
+                logger.warning(
+                    "[SM70-DFlash2-L3] kv dump: no full-attn KV tensor found; "
+                    "kinds=%s", kv_kind[:20]
+                )
+                return
+            # Shape is [num_blocks, 2, block_size, kv_heads, head_dim] (5D).
+            if kv.dim() == 5:
+                block_size = int(kv.shape[2])
+                kv_heads = int(kv.shape[3])
+                head_dim = int(kv.shape[4])
+            else:
+                block_size = int(kv.shape[1])
+                kv_heads = int(kv.shape[2])
+                head_dim = int(kv.shape[3])
+            num_pool_blocks = int(kv.shape[0])
+
+            nr = input_batch.num_reqs
+            seq_lens = [int(x) for x in input_batch.seq_lens[:nr].tolist()]
+            num_sched = [
+                int(x) for x in input_batch.num_scheduled_tokens[:nr].tolist()
+            ]
+            total_sched = sum(num_sched)
+
+            # Block table + slot mapping are per-KV-cache-group on the
+            # BlockTables object: input_block_tables[g] is the exact DST
+            # table the attention kernel reads, slot_mappings[g] holds this
+            # step's write-slot map. The full-attention group is the one
+            # whose spec is not a MambaSpec (GDN groups carry MambaSpec).
+            from vllm.v1.kv_cache_interface import MambaSpec
+
+            fa_group = None
+            for gi, grp in enumerate(self.kv_cache_config.kv_cache_groups):
+                if not isinstance(grp.kv_cache_spec, MambaSpec):
+                    fa_group = gi
+                    break
+            if fa_group is None:
+                logger.warning(
+                    "[SM70-DFlash2-L3] kv dump: no full-attn kv cache group"
+                )
+                return
+            bt = self.block_tables.input_block_tables[fa_group][:nr]
+            bt_cpu = bt.detach().cpu().clone()
+            sm_cpu = (
+                self.block_tables.slot_mappings[fa_group][:total_sched]
+                .detach()
+                .cpu()
+                .clone()
+            )
+            # Per-request block count the gather kernel used (num_blocks
+            # undercount -> stale DST row beyond that count = read bug).
+            try:
+                num_blocks_cpu = (
+                    self.block_tables.num_blocks.np[fa_group][:nr].tolist()
+                )
+            except Exception:
+                num_blocks_cpu = []
+            # slot_mapping covers scheduled tokens in request order; request r
+            # contributes its last num_sched[r] positions (decode continues at
+            # seq_len - num_sched; prefill starts at 0).
+            mismatches = []
+            pads = 0
+            checked = 0
+            if sm_cpu is not None:
+                pos = 0
+                for r in range(nr):
+                    start = seq_lens[r] - num_sched[r]
+                    for i in range(num_sched[r]):
+                        gpos = start + i
+                        exp = (
+                            int(bt_cpu[r, gpos // block_size].item())
+                            * block_size
+                            + (gpos % block_size)
+                        )
+                        got = int(sm_cpu[pos].item())
+                        checked += 1
+                        if got < 0:
+                            pads += 1
+                        elif got != exp:
+                            mismatches.append([r, gpos, exp, got])
+                        pos += 1
+                if pos != sm_cpu.numel():
+                    mismatches.append(
+                        ["__len__", sm_cpu.numel(), pos, 0]  # length mismatch
+                    )
+            # Slots written this step (non-negative slot_mapping values):
+            # lets the analyzer tell "write produced NaN" (slot in set)
+            # from "stale residue" (slot not written this step).
+            written_slots = (
+                sorted({int(s) for s in sm_cpu.tolist() if s >= 0})
+                if sm_cpu is not None
+                else []
+            )
+
+            # Blocks referenced by the request rows (valid ids only).
+            cap = min(bt_cpu.shape[1], 128)
+            rows = bt_cpu[:nr, :cap]
+            all_ids = sorted({int(b) for row in rows for b in row.tolist() if b >= 0})
+            if len(all_ids) > 512:
+                all_ids = all_ids[:512]
+            idx = torch.tensor(all_ids, dtype=torch.int32, device=kv.device)
+            kv_sub = kv[idx].clone().cpu()
+            a = kv_sub.float().numpy()  # bf16 has no numpy dtype
+            nan_counts = {
+                i: int(np.isnan(a[j]).sum()) for j, i in enumerate(all_ids)
+            }
+            # Per-slot NaN map: for each request, each table-block in its
+            # legitimate range, per 16-slot position -> NaN count. This
+            # localizes WHICH slots hold NaN (read side) and whether they
+            # align with the write slots (slot_mapping side).
+            slot_nan_map = {}
+            slot_val_sample = {}
+            for r in range(nr):
+                nblk = (seq_lens[r] + block_size - 1) // block_size
+                per_req = []
+                for bidx in range(nblk):
+                    bid = int(bt_cpu[r, bidx].item())
+                    if bid < 0 or bid not in nan_counts:
+                        per_req.append(None)
+                        continue
+                    j = all_ids.index(bid)
+                    # Per-slot: kv_sub[j] is [2, bs, h, d] or [bs, h, d].
+                    blk = a[j]
+                    if blk.ndim == 4:
+                        per_slot = [
+                            int(np.isnan(blk[:, s, :, :]).sum())
+                            for s in range(block_size)
+                        ]
+                    else:
+                        per_slot = [
+                            int(np.isnan(blk[s, :, :]).sum())
+                            for s in range(block_size)
+                        ]
+                    per_req.append(per_slot)
+                    if any(p > 0 for p in per_slot) and len(slot_val_sample) < 8:
+                        slot_val_sample[f"req{r}_blk{bidx}_id{bid}"] = per_slot
+                slot_nan_map[r] = per_req
+            # Per-slot K/V split (5D only): tells whether the stale NaN is
+            # on the K side (-> all-NaN attention rows) or V side (-> partial
+            # structured NaN rows).
+            slot_kv_split = {}
+            for r in range(nr):
+                nblk = (seq_lens[r] + block_size - 1) // block_size
+                per_req = []
+                for bidx in range(nblk):
+                    bid = int(bt_cpu[r, bidx].item())
+                    if bid < 0 or bid not in nan_counts:
+                        per_req.append(None)
+                        continue
+                    j = all_ids.index(bid)
+                    blk = a[j]
+                    if blk.ndim == 4:  # [2, bs, h, d]
+                        per_k = [
+                            int(np.isnan(blk[0, s, :, :]).sum())
+                            for s in range(block_size)
+                        ]
+                        per_v = [
+                            int(np.isnan(blk[1, s, :, :]).sum())
+                            for s in range(block_size)
+                        ]
+                        per_req.append((per_k, per_v))
+                    else:
+                        per_req.append(None)
+                slot_kv_split[r] = per_req
+
+            rank = 0
+            try:
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_rank,
+                )
+
+                rank = int(get_tensor_model_parallel_rank())
+            except Exception:
+                pass
+            out = {
+                "step": int(self._sentinel_step),
+                "rank": rank,
+                "layer": 3,
+                "block_size": block_size,
+                "num_kv_heads": kv_heads,
+                "head_dim": head_dim,
+                "dtype": str(kv.dtype),
+                "num_pool_blocks": num_pool_blocks,
+                "kv_data_ptr": int(kv.data_ptr()),
+                "seq_lens": seq_lens,
+                "num_scheduled": num_sched,
+                "num_blocks": num_blocks_cpu,
+                "block_ids": all_ids,
+                "block_table": bt_cpu,
+                "slot_mapping": sm_cpu,
+                "slot_check": {
+                    "checked": checked,
+                    "pads": pads,
+                    "mismatches": mismatches[:64],
+                    "n_mismatches": len(mismatches),
+                },
+                "kv_blocks": kv_sub,
+                "kv_blocks_nan_counts": nan_counts,
+                "slot_nan_map": slot_nan_map,
+                "slot_kv_split": slot_kv_split,
+                "written_slots": written_slots,
+                "slot_nan_sample": slot_val_sample,
+            }
+            path = f"/tmp/sm70-kvdump_step{self._sentinel_step}_rank{rank}.pt"
+            torch.save(out, path)
+            logger.warning(
+                "[SM70-DFlash2-L3] KV dump step=%d rank=%d: %d blocks "
+                "referenced (pool=%d), slot check: %d checked, %d mismatches, "
+                "%d pads; block NaN: %s -> %s",
+                self._sentinel_step,
+                rank,
+                len(all_ids),
+                num_pool_blocks,
+                checked,
+                len(mismatches),
+                pads,
+                {k: v for k, v in nan_counts.items() if v > 0}
+                or "ALL CLEAN",
+                path,
+            )
+            if mismatches:
+                logger.warning(
+                    "[SM70-DFlash2-L3] slot mismatches (req,gpos,expected,got): "
+                    "%s",
+                    mismatches[:16],
+                )
+        except Exception as exc:
+            logger.warning("[SM70-DFlash2-L3] kv dump failed: %r", exc)
 
     def postprocess(
         self,
@@ -1435,6 +1930,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled,
                 num_rejected,
                 input_batch,
+                hidden_states,
+                attn_metadata,
             )
 
         if self.use_pp:

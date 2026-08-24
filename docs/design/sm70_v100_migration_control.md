@@ -593,6 +593,98 @@ Goal:
   relevant, but the independently adapted block-FP8 implementation in Draft PR
   #258 currently rejects speculative configurations. It must pass a dedicated
   DFlash2 M=8 contract and quality gate before stacking onto this PR.
+### DFlash2 concurrency>=2 out-of-bounds draft path, 2026-08-22
+
+- Independent of the K-norm repair above: on a freshly started engine,
+  `num_speculative_tokens=7` with two concurrent requests is healthy
+  (mean acceptance 2.3998/7, zero guard hits). After the engine accumulates
+  prefix-cache state (twenty prefix-heavy rounds plus a concurrent
+  single-request phase), the same conc=2 workload degrades to
+  mean acceptance 0.0558/7 (per-position
+  [1.3%, 1.1%, 0.9%, 0.8%, 0.6%, 0.5%, 0.4%]) roughly eleven minutes in,
+  with no crash while the selector value clamp (P2a) is present. The
+  corruption is state-dependent and multi-request-only; single-request
+  execution never shows it.
+- The post-step replay guard shows a constant per-step signature at
+  corruption: the anchor slots (`input_ids[req*8]`, i.e. the `is_bonus`
+  slot of the prepare kernel) hold exactly `vocab_size` (248320 for the
+  DFlash2 draft, one past the last valid id), while the mask slots hold
+  the in-range `mask_token_id` (248070). The OOB value is therefore the
+  bonus token, not the mask placeholder.
+- The bonus token is `last_sampled[req_state_idx]`, written by the input
+  batch post-update as `sampled_tokens[req_id, num_sampled-1]`; with the
+  observed `num_sampled=1` per request it is the rejection sampler's
+  output at the target's first logit position. The rejection-sampler path
+  contains no vocabulary sentinel. Code-level timing of
+  `model_runner.sample_tokens` settles the attribution question in advance
+  of the dump: the post-update writes `last_sampled` and only then does
+  `speculator.propose` rebuild the query block and run the guard, so the
+  anchor slot the guard reads at step N equals step N's own sampled token.
+  A guard hit therefore means the rejection sampler emitted an OOB token at
+  that step; a stale-slot explanation is excluded for `num_sampled > 0`
+  (a `num_sampled == 0` / chunked-prefill branch remains possible). The
+  first dumped record also carries the target's input for that step
+  (previous bonus plus the draft tokens under verification), which
+  classifies the root event: in-range target input means the target
+  forward/sampling path itself emitted the OOB id, while OOB ids in the
+  draft segment mean the DFlash2 draft model emitted them from a clean
+  bonus. After the first emission the loop is self-perpetuating: the OOB
+  bonus feeds an OOB embedding read each step, producing constant garbage
+  target logits and a constant degenerate sample.
+- **Root-cause verdict (2026-08-22, Exp A2 run2 full forensic analysis):
+  ROOT-AT-SAMPLER.** The V3 dump image (`...-guardforensic2`) captured the
+  complete conc=2 window (5720 deduped steps, 15915..21634, both TP
+  workers). Formal attribution (`analyze_dump.py` over 11440 records):
+  at the first sampled-V step the target input for both requests was
+  fully in range (74/74 tokens; per-request segments min/max 3709..108594
+  and 11..248068) while the rejection sampler's bonus output was exactly
+  `vocab_size` (248320) for both; draft tokens were in range at every
+  step of the window (0 OOB proposals), and the written bonus always
+  equals the current step's sampler output (0 mismatches). After the
+  first emission the loop is self-perpetuating for 5719 steps (OOB bonus
+  -> OOB embedding -> garbage logits -> constant V). The draft model is
+  exonerated; the root is in the target-side sampling path on this SM70
+  build.
+- **Trigger signature (22 fresh-emission events, all analyzed)**: every
+  fresh V emission - the root event plus 21 later re-triggers, one per
+  subsequent new-request arrival - happens on a **mixed prefill+decode
+  batch step** (one fresh full prefill, 65-91 tokens from position 0,
+  plus one decode request of 8 tokens); pure decode+decode batches never
+  trigger (thousands of steps, zero events). The value is exactly
+  `vocab_size` in 22/22 events (deterministic boundary value, not random
+  memory). At each trigger the prefill request shows `num_rejected=0`
+  (prefill requests have no drafts to verify): its bonus is a plain
+  end-of-prefill single-token sample, and the decode request's bonus is a
+  rejection-sampler sample after 7 rejections - both are the sampler's
+  **single-token (non-speculative) path**. The loop is per-request: once
+  a request enters it, it persists; a new request is not infected by an
+  already-looping batchmate (it stays clean until its own prefill step
+  under mixed geometry). The dirty-prefix-cache prerequisite is required
+  (fresh conc=2 never triggers across multiple runs) but does not act
+  through prefill geometry - all 22 trigger prefills are full,
+  cache-miss-free, position-0 prefills - so it acts through internal
+  engine state (block table / KV layout). Prime mechanism hypothesis:
+  an off-by-one in the single-token sampling path under mixed-batch
+  geometry (CDF/`searchsorted` boundary returning `vocab_size`, or a
+  stride/offset error selecting the wrong logits row).
+- Defensive status: the P2a selector clamp (`[-V, V-1]`) bounds the
+  corruption to rejected drafts - the engine no longer crashes, and the
+  affected steps degrade to no-speculative speed. Run2 terminal state:
+  conc=2 wall 1175.2s, 10.15 tok/s, 0.0558/7 acceptance (identical to
+  run1), 0 failures, restartCount 0. The root fix is open and designed
+  in `build-artifacts/ws4-20260822/p2b/P2B_ROOT_FIX_DESIGN.md` (L1:
+  vocabulary sentinel at the sampler-output/post-update boundary with
+  structured logging + no-speculative fallback; L2: root-cause hunt
+  focused on the single-token sampling path under mixed geometry).
+  Instrumentation note: the first dump image (v2 patcher) logged zero
+  records because `InputBatch.num_scheduled_tokens` is a numpy array,
+  not a tensor, and the dump code called `.detach()` on it
+  (AttributeError on every guard hit); the V3 patcher routes all dump
+  fields through a numpy/tensor-agnostic helper (image
+  `...-guardforensic2`).
+  Evidence and the instrumentation plan are tracked in
+  `build-artifacts/gdn-oob-workplan-20260822.md` (2026-08-22, Exp A /
+  Exp A2 entries) and `build-artifacts/ws4-20260822/p2b/`.
 
 Main implementation priority:
 

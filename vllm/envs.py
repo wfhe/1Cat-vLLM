@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS: int = 8
     VLLM_SM70_AUX_KERNEL_WARMUP: bool = True
     VLLM_SM70_DFLASH2_SAMPLER_SENTINEL: bool = True
+    VLLM_SM70_DFLASH2_LOGITS_DUMP: bool = False
     VLLM_SM70_GEMM_LUT_PATH: str | None = None
     VLLM_SM70_AWQ_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_FP8_DENSE_TUNE_MAX_M: int = 16
@@ -1576,6 +1577,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt out with VLLM_SM70_DFLASH2_SAMPLER_SENTINEL=0.
     "VLLM_SM70_DFLASH2_SAMPLER_SENTINEL": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_SAMPLER_SENTINEL", "1"))
+    ),
+    # SM70 DFlash2 P2b-L2 forensic: when the rejection sampler emits an
+    # out-of-range token, dump the sampled row of target_logits (width/max/
+    # min/argmax/NaN/Inf + full row to .npy) plus the sampler geometry
+    # (expanded_local_pos / idx_mapping / pos / draft_sampled /
+    # cu_num_logits / num_sampled) and the raw sampled buffer to
+    # /tmp/forensic-logits-<pid>.jsonl. Off by default (per-step OOB check).
+    "VLLM_SM70_DFLASH2_LOGITS_DUMP": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_LOGITS_DUMP", "0"))
     ),
     "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND": lambda: bool(
         int(os.getenv("VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND", "0"))
