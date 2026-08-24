@@ -934,4 +934,10 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
+        # The window may extend past the last table column for long
+        # requests (start = (seq_len - 1) // block_size can reach
+        # row_width - 1, and the window spans num_speculative_blocks
+        # columns beyond it). Clamp like gather_gdn_state_block_ids so
+        # the gather stays in range instead of faulting.
+        indices_to_gather = torch.clamp(indices_to_gather, max=block_table.shape[1] - 1)
         return torch.gather(block_table, 1, indices_to_gather)

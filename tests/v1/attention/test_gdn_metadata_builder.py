@@ -34,12 +34,16 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
+    _pad_invalid_gdn_spec_state_ids,
     build_gdn_spec_decode_state_contract,
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
     prepare_dflash2_gdn_group_metadata,
 )
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
@@ -1675,3 +1679,217 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
 
     assert out is core_attn_out
     assert calls == ["layer.0"]
+
+
+# ---------------------------------------------------------------------------
+# SM70 GDN state OOB fix (P1): contract defense for the align-mode spec
+# state window. Crash step: prefix-resumed request with
+# num_computed_tokens=9 on block_size=8, mamba_cache_mode="align",
+# DFlash2 num_spec=7. The align gather produces an 8-wide window ending at
+# the current block; tail columns past the request's last committed state
+# block are invalid (stale pre-zeroing, PAD_SLOT_ID post-zeroing) and must
+# never reach the GDN kernels as state-block ids.
+# ---------------------------------------------------------------------------
+
+
+def test_gdn_state_contract_align_window_pads_invalid_state_ids(monkeypatch):
+    """Crash-dump repro at the contract level (align mode, short request).
+
+    num_computed_tokens=9, block_size=8 -> current block index 1, so the
+    align window is [block1, <over-wide tail>]. With over-wide columns
+    zeroed to PAD_SLOT_ID, the contract must replace the invalid tail with
+    the request's last valid state block and the range assert must pass.
+    """
+    monkeypatch.setenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT", "1")
+
+    block_table_tensor = torch.tensor(
+        [
+            [5, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID],
+            [7, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID],
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    contract = build_gdn_spec_decode_state_contract(
+        block_table_tensor=block_table_tensor,
+        seq_lens=torch.tensor([9, 4], dtype=torch.int32, device=DEVICE),
+        block_size=8,
+        num_spec=4,
+        spec_sequence_masks_cpu=torch.tensor(
+            [True, False], dtype=torch.bool, device="cpu"
+        ),
+        num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device=DEVICE),
+        current_state_block_ids=None,
+        is_mamba_cache_all=False,
+        num_state_blocks=100,
+    )
+
+    assert contract.spec_state_indices_tensor.tolist() == [[5] * 5]
+    assert contract.non_spec_state_indices_tensor.tolist() == [7]
+
+
+def test_gdn_state_contract_range_assert_catches_stale_oob_ids(monkeypatch):
+    """Reverse-verify the tripwire: a stale over-wide id >= num_state_blocks
+    (the OOB crash class before the block table is zeroed) must be rejected
+    by the new value-range assert."""
+    monkeypatch.setenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT", "1")
+
+    block_table_tensor = torch.tensor(
+        [[5, 150, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID]],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    with pytest.raises(AssertionError, match="outside \\[0, 100\\]"):
+        build_gdn_spec_decode_state_contract(
+            block_table_tensor=block_table_tensor,
+            seq_lens=torch.tensor([9], dtype=torch.int32, device=DEVICE),
+            block_size=8,
+            num_spec=4,
+            spec_sequence_masks_cpu=torch.tensor(
+                [True], dtype=torch.bool, device="cpu"
+            ),
+            num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=DEVICE),
+            current_state_block_ids=None,
+            is_mamba_cache_all=False,
+            num_state_blocks=100,
+        )
+
+
+def test_gdn_state_contract_range_assert_catches_negative_ids(monkeypatch):
+    """Defense in depth: a negative id on the non-spec path must be
+    rejected by the value-range assert even though the spec path pads
+    them away."""
+    monkeypatch.setenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT", "1")
+    # The legacy slot-0 shortcut would otherwise keep the non-spec row on
+    # column 0; disable it so the accepted-slot selection (column 1) hits
+    # the invalid id and the value-range assert must fire.
+    monkeypatch.setenv("VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", "0")
+
+    block_table_tensor = torch.tensor(
+        [
+            [5, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID],
+            [7, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID, PAD_SLOT_ID],
+        ],
+        dtype=torch.int32,
+        device=DEVICE,
+    )
+
+    with pytest.raises(AssertionError, match="outside \\[0, 100\\]"):
+        build_gdn_spec_decode_state_contract(
+            block_table_tensor=block_table_tensor,
+            seq_lens=torch.tensor([9, 4], dtype=torch.int32, device=DEVICE),
+            block_size=8,
+            num_spec=4,
+            spec_sequence_masks_cpu=torch.tensor(
+                [True, False], dtype=torch.bool, device="cpu"
+            ),
+            # accepted=2 selects column 1 of the non-spec row, which is
+            # PAD_SLOT_ID here.
+            num_accepted_tokens=torch.tensor([2, 2], dtype=torch.int32, device=DEVICE),
+            current_state_block_ids=None,
+            is_mamba_cache_all=False,
+            num_state_blocks=100,
+        )
+
+
+def test_mamba_get_block_table_tensor_align_clamps_window_to_table():
+    """L3: long requests may push the align window start past the last
+    table column; the gather must clamp instead of faulting."""
+    spec = MambaSpec(
+        block_size=4,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        num_speculative_blocks=7,
+    )
+    table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+
+    # start = (16 - 1) // 4 = 3, window cols 3..10 clamp to col 3.
+    out = mamba_get_block_table_tensor(
+        table, torch.tensor([16], dtype=torch.int32), spec, "align"
+    )
+    assert out.tolist() == [[13] * 8]
+
+    # start = (8 - 1) // 4 = 1, window cols 1..8 clamp to col 3.
+    out = mamba_get_block_table_tensor(
+        table, torch.tensor([8], dtype=torch.int32), spec, "align"
+    )
+    assert out.tolist() == [[11, 12, 13, 13, 13, 13, 13, 13]]
+
+    # start = 0 for the shortest request, window cols 0..7 clamp to col 3.
+    out = mamba_get_block_table_tensor(
+        table, torch.tensor([1], dtype=torch.int32), spec, "align"
+    )
+    assert out.tolist() == [[10, 11, 12, 13, 13, 13, 13, 13]]
+
+
+def test_pad_invalid_gdn_spec_state_ids_edge_cases():
+    unchanged = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+    assert _pad_invalid_gdn_spec_state_ids(unchanged).tolist() == [[1, 2, 3]]
+
+    # A future allocation exists (valid id beyond column 0), so the
+    # invalid tail is an engine allocation violation: leave it for the
+    # debug assert / kernel guards instead of masking it.
+    mixed = torch.tensor([[9, 3, -1, -1]], dtype=torch.int32)
+    assert _pad_invalid_gdn_spec_state_ids(mixed).tolist() == [[9, 3, -1, -1]]
+
+    # No future allocation: every invalid tail id maps to column 0, the
+    # current block where the accepted draft states live.
+    no_future = torch.tensor([[5, -1, -1, -1]], dtype=torch.int32)
+    assert _pad_invalid_gdn_spec_state_ids(no_future).tolist() == [[5, 5, 5, 5]]
+
+    # All-invalid row (degenerate padding only) falls back to block 0.
+    all_invalid = torch.tensor([[-1, -1]], dtype=torch.int32)
+    assert _pad_invalid_gdn_spec_state_ids(all_invalid).tolist() == [[0, 0]]
+
+    empty = torch.empty((0, 4), dtype=torch.int32)
+    assert _pad_invalid_gdn_spec_state_ids(empty).numel() == 0
+
+
+def test_gdn_builder_align_short_request_contract(
+    local_gdn_model,
+    monkeypatch,
+):
+    """End-to-end: builder.build() in align mode with a short spec request
+    (the crash step shape) and num_state_blocks passed through to the
+    contract. The window extends past the two-column block table, so the
+    L3 clamp and L1 pad both run on the live path."""
+    monkeypatch.setenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT", "1")
+
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        mamba_cache_mode="align",
+    )
+    batch = BatchSpec(
+        seq_lens=[17, 8],
+        query_lens=[4, 1],
+    )
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    common = common.replace(
+        block_table_tensor=torch.tensor(
+            [
+                [5, 6],
+                [7, 8],
+            ],
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+    )
+
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=torch.tensor([2, 1], dtype=torch.int32, device=DEVICE),
+        num_decode_draft_tokens_cpu=torch.tensor(
+            [3, -1], dtype=torch.int32, device="cpu"
+        ),
+        num_state_blocks=100,
+    )
+
+    assert meta.num_spec_decodes == 1
+    # Spec request: current block index (17 - 1) // 16 = 1; window cols
+    # 1..5 clamp to col 1 (block 6), and the contract keeps it as-is
+    # because it is a valid state id.
+    assert meta.spec_state_indices_tensor[:1].tolist() == [[6, 6, 6, 6, 6]]

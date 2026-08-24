@@ -5475,6 +5475,11 @@ class GPUModelRunner(
                     extra_attn_metadata_args["spec_state_slot_selectors"] = (
                         self.spec_state_slot_selectors.gpu[:num_reqs_padded]
                     )
+                    # Total mamba state blocks; the GDN state-contract assert
+                    # rejects state-block ids outside [0, num_state_blocks).
+                    extra_attn_metadata_args["num_state_blocks"] = (
+                        self.kv_cache_config.num_blocks
+                    )
                 if ddtree_parent_metadata is not None and isinstance(
                     builder, GDNAttentionMetadataBuilder
                 ):

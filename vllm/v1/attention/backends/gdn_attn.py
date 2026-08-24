@@ -565,6 +565,42 @@ def select_gdn_state_block_ids(
     return block_table[row_indices, state_offsets]
 
 
+def _pad_invalid_gdn_spec_state_ids(window: torch.Tensor) -> torch.Tensor:
+    """Replace invalid state-block ids for no-future-allocation requests.
+
+    In ``mamba_cache_mode="align"`` the block table is pre-gathered into a
+    ``1 + num_speculative_blocks``-wide window starting at the current
+    block. A request that holds no state blocks beyond the current one
+    (the spec-decode crash shape: future columns never allocated) carries
+    ``PAD_SLOT_ID`` or stale ids in the tail columns, but every accepted
+    draft state still lives in the current block (window column 0). Those
+    rows are padded to column 0 so the state-copy kernels never see
+    negative ids.
+
+    Rows with a valid id beyond column 0 are left untouched: an invalid
+    column there means the engine allocated future state blocks but left a
+    hole, a genuine allocation violation. The debug
+    ``VLLM_SM70_GDN_STATE_CONTRACT_ASSERT`` path and the kernel-side guards
+    are responsible for catching it instead of masking it. All-invalid
+    rows (degenerate CUDA-graph padding only) fall back to state block 0,
+    which always exists.
+    """
+    if window.numel() == 0:
+        return window
+    invalid = window < 0
+    if not bool(torch.any(invalid).item()):
+        return window
+    # A row has no future state-block allocation when no column beyond
+    # the current block (column 0) holds a valid id.
+    no_future = ~(window[:, 1:] >= 0).any(dim=1)
+    col0 = window[:, :1]
+    col0 = torch.where(col0 < 0, torch.zeros_like(col0), col0)
+    pad_mask = invalid & no_future.unsqueeze(1)
+    if not bool(torch.any(pad_mask).item()):
+        return window
+    return torch.where(pad_mask, col0, window)
+
+
 def build_gdn_spec_decode_state_contract(
     *,
     block_table_tensor: torch.Tensor,
@@ -576,6 +612,7 @@ def build_gdn_spec_decode_state_contract(
     current_state_block_ids: torch.Tensor | None,
     is_mamba_cache_all: bool,
     spec_state_slot_selectors: torch.Tensor | None = None,
+    num_state_blocks: int | None = None,
 ) -> GDNSpecDecodeStateContract:
     """Build the state-index/count contract consumed by active-MTP GDN.
 
@@ -585,6 +622,10 @@ def build_gdn_spec_decode_state_contract(
     speculative slot as ``num_accepted_tokens - 1`` in the recurrent kernels.
     DDTree can accept a non-linear tree path, so callers may pass
     ``spec_state_slot_selectors`` to select that slot independently.
+
+    ``num_state_blocks`` is the total number of mamba state blocks; when
+    provided, the contract assert also rejects state-block ids outside
+    ``[0, num_state_blocks)`` in every branch.
     """
     assert spec_sequence_masks_cpu.dtype == torch.bool
     assert num_accepted_tokens is not None
@@ -604,6 +645,7 @@ def build_gdn_spec_decode_state_contract(
     if current_state_block_ids is not None:
         current_mask = _mask_for(current_state_block_ids)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
+        state_block_ids = _pad_invalid_gdn_spec_state_ids(state_block_ids)
         spec_state_indices_tensor = state_block_ids[current_mask]
         non_spec_source = state_block_ids[~current_mask]
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
@@ -625,7 +667,14 @@ def build_gdn_spec_decode_state_contract(
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
+        # Align mode pre-gathers a (1 + num_speculative_blocks)-wide window
+        # starting at the current block per request. Requests without
+        # future state blocks carry invalid tail columns (PAD_SLOT_ID once
+        # the block table is zeroed, stale before that); map them to the
+        # current block before exposing them to the kernels.
+        spec_state_indices_tensor = _pad_invalid_gdn_spec_state_ids(
+            block_table_tensor[block_mask, : num_spec + 1]
+        )
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
             block_table_tensor[~block_mask],
             num_accepted_tokens[~accepted_mask],
@@ -691,6 +740,20 @@ def build_gdn_spec_decode_state_contract(
                     "GDN spec state contract mismatch: active align-mode "
                     "state ids contain PAD_SLOT_ID"
                 )
+        if num_state_blocks is not None:
+            for name, tensor in (
+                ("spec_state_indices_tensor", spec_state_indices_tensor),
+                ("non_spec_state_indices_tensor", non_spec_state_indices_tensor),
+            ):
+                if tensor.numel() == 0:
+                    continue
+                out_of_range = (tensor < 0) | (tensor >= num_state_blocks)
+                if bool(torch.any(out_of_range).item()):
+                    raise AssertionError(
+                        f"GDN spec state contract mismatch: {name} holds "
+                        f"state-block ids outside [0, {num_state_blocks}]: "
+                        f"{tensor.detach().cpu().tolist()}"
+                    )
 
     return GDNSpecDecodeStateContract(
         spec_state_indices_tensor=spec_state_indices_tensor,
@@ -1281,6 +1344,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ddtree_fast_build_epoch: int | None = None,
         for_cudagraph_capture: bool = False,
         fast_build: bool = False,
+        num_state_blocks: int | None = None,
     ) -> GDNAttentionMetadata:
         metadata_profile = _dflash_ddtree_metadata_profile_enabled()
         metadata_profile_t0 = time.perf_counter() if metadata_profile else 0.0
@@ -1623,6 +1687,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     current_state_block_ids=current_state_block_ids,
                     is_mamba_cache_all=is_mamba_cache_all,
                     spec_state_slot_selectors=spec_state_slot_selectors,
+                    num_state_blocks=num_state_blocks,
                 )
                 if metadata_profile:
                     profile_state_contract_ms = (
