@@ -139,6 +139,15 @@ inline int sm70_tp4_m5_allreduce_threads(int world_size,
   return static_cast<int>(parsed);
 }
 
+inline bool sm70_tp4_small_allreduce_pack32(int world_size,
+                                            bool fully_connected,
+                                            size_t bytes) {
+  const char* raw = std::getenv("VLLM_SM70_TP4_SMALL_AR_PACK32");
+  return raw != nullptr && std::atoi(raw) != 0 && world_size == 4 &&
+         fully_connected && bytes == 5120 * sizeof(half) &&
+         custom_allreduce_current_device_is_sm70();
+}
+
 // Counter may overflow, but unsigned integer overflow is well-defined.
 using FlagType = sm70_tile_runtime::FlagType;
 using Signal = sm70_tile_runtime::Signal;
@@ -292,11 +301,49 @@ static DINLINE FlagType ld_flag_sys_visible(FlagType* flag_addr) {
   return flag;
 }
 
+static DINLINE void membar_sys() {
+  asm volatile("membar.sys;" ::: "memory");
+}
+
+// The TP4 pack32 route waits with volatile peer loads, then executes one
+// system fence after the matching flag is visible. This preserves the input
+// visibility contract without putting a system fence in every poll iteration.
+template <int ngpus>
+DINLINE void sm70_pack32_barrier_at_start(const RankSignals& sg,
+                                          Signal* self_sg, int rank) {
+  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    const unsigned int peer = threadIdx.x;
+    auto peer_counter_ptr = &sg.signals[peer]->start[blockIdx.x][rank];
+    auto self_counter_ptr = &self_sg->start[blockIdx.x][peer];
+    st_flag_sys_visible(peer_counter_ptr, flag);
+    while (ld_flag_volatile(self_counter_ptr) != flag);
+    membar_sys();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
+template <int ngpus>
+DINLINE void sm70_pack32_barrier_at_end(const RankSignals& sg,
+                                        Signal* self_sg, int rank) {
+  __syncthreads();
+  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    const unsigned int peer = threadIdx.x;
+    auto peer_counter_ptr = &sg.signals[peer]->end[blockIdx.x][rank];
+    auto self_counter_ptr = &self_sg->end[blockIdx.x][peer];
+    st_flag_volatile(peer_counter_ptr, flag);
+    while (ld_flag_volatile(self_counter_ptr) != flag);
+  }
+  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
 // This function is meant to be used as the first synchronization in the all
-// reduce kernel. The all-reduce input is usually produced by kernels launched
-// immediately before this kernel on each rank. Use a system memory fence around
-// the peer-visible flag so faster upstream paths do not expose stale input to
-// peer ranks.
+// reduce kernel. Publish the peer flag after a system fence, poll it with a
+// volatile load, then execute one system fence after the matching value is
+// visible. The post-poll fence preserves input visibility without putting a
+// system fence in every spin-loop iteration.
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
@@ -307,7 +354,8 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     // Write the expected counter value to peer and wait for correct value
     // from peer.
     st_flag_sys_visible(peer_counter_ptr, flag);
-    while (ld_flag_sys_visible(self_counter_ptr) != flag);
+    while (ld_flag_volatile(self_counter_ptr) != flag);
+    membar_sys();
   }
   __syncthreads();
   // use one thread to update flag
@@ -342,6 +390,38 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 }
 
 #else
+
+template <int ngpus>
+DINLINE void sm70_pack32_barrier_at_start(const RankSignals& sg,
+                                          Signal* self_sg, int rank) {
+  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    const unsigned int peer = threadIdx.x;
+    __scoped_atomic_store_n(&sg.signals[peer]->start[blockIdx.x][rank], flag,
+                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][peer],
+                                  __ATOMIC_RELAXED,
+                                  __MEMORY_SCOPE_DEVICE) < flag);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
+
+template <int ngpus>
+DINLINE void sm70_pack32_barrier_at_end(const RankSignals& sg,
+                                        Signal* self_sg, int rank) {
+  __syncthreads();
+  uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
+  if (threadIdx.x < ngpus) {
+    const unsigned int peer = threadIdx.x;
+    __scoped_atomic_store_n(&sg.signals[peer]->end[blockIdx.x][rank], flag,
+                            __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    while (__scoped_atomic_load_n(&self_sg->end[blockIdx.x][peer],
+                                  __ATOMIC_RELAXED,
+                                  __MEMORY_SCOPE_DEVICE) < flag);
+  }
+  if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
+}
 
 template <int ngpus>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
@@ -426,6 +506,23 @@ __global__ void __launch_bounds__(512, 1)
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+template <int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    sm70_cross_device_reduce_1stage_pack32(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        half* __restrict__ result, int rank, int size) {
+  using P = array_t<half, 16>;
+  using A = array_t<float, 16>;
+  auto dp = *_dp;
+  sm70_pack32_barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    reinterpret_cast<P*>(result)[idx] =
+        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
+  }
+  sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
 // This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
@@ -1119,6 +1216,16 @@ class CustomAllreduce {
     threads = sm70_tp4_m5_allreduce_threads(world_size_, fully_connected_,
                                             bytes);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
+
+    if constexpr (std::is_same_v<T, half>) {
+      if (blocks == 1 && threads == 512 &&
+          sm70_tp4_small_allreduce_pack32(world_size_, fully_connected_,
+                                          bytes)) {
+        sm70_cross_device_reduce_1stage_pack32<4><<<1, 512, 0, stream>>>(
+            ptrs, sg_, self_sg_, output, rank_, bytes / 32);
+        return;
+      }
+    }
 
     // Check environment variable once
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");

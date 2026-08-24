@@ -208,6 +208,26 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out,
                                   bool fast_decoder,
                                   bool prefetch_codes);
 
+std::vector<torch::Tensor> nvfp4_qpn4_prepare_sm70(torch::Tensor qweight,
+                                                   torch::Tensor scales);
+
+std::vector<torch::Tensor> nvfp4_qpn4_prepare_scale_code_sm70(
+    torch::Tensor qweight, torch::Tensor scale_codes);
+
+void nvfp4_qpn4_dequantize_sm70_out(
+    torch::Tensor out, torch::Tensor codes, torch::Tensor scales,
+    double global_scale, bool use_scale_code);
+
+void nvfp4_qpn4_prefill_sm70_out(
+    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor input,
+    torch::Tensor codes, torch::Tensor scales, double global_scale,
+    bool use_scale_code, bool gated_silu);
+
+void nvfp4_qpn4_dispatch_sm70_out(
+    torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor input,
+    torch::Tensor codes, torch::Tensor scales, double global_scale,
+    bool use_scale_code, bool gated_silu);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,

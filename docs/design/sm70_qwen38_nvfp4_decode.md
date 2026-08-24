@@ -1,6 +1,6 @@
 # SM70 Qwen3.8-27B-NVFP4 Decode Recovery
 
-Date: 2026-08-23
+Date: 2026-08-23; acceptance updated 2026-08-24
 
 ## Decision
 
@@ -11,11 +11,13 @@ output shapes. Remaining channel-FP8 projections, including the LM head, use
 TurboMind W8A16. NVFP4 projections use TurboMind W4A16. No accepted result in
 this document credits a Marlin fallback.
 
-The final route also adds E4M3 KV support to Flash-V100 XQA and selects a p64
-partition for the exact batch-one, G6/D256 layout. This is the change that
+The recovery route also adds E4M3 KV support to Flash-V100 XQA and selects a
+p64 partition for the exact batch-one, G6/D256 layout. This is the change that
 makes the frozen native-sampler result exceed 70 tok/s. The p64 route is
 restricted to E4M3, batch one, G6/D256; the existing E5M2 and FP16 policies
-are unchanged.
+are unchanged. The later no-MTP 80 tok/s acceptance adds exact QPN4, TP4
+all-reduce, QPN8 specialization, and an exact-Philox chunked sampler sidecar;
+that acceptance is recorded at the end of this document.
 
 ## Frozen Contract
 
@@ -29,7 +31,9 @@ are unchanged.
   `FULL_AND_PIECEWISE` CUDA graphs.
 - Request: input 1024, natural output cap 256, no `ignore_eos`, no MTP.
 - Sampling: temperature 1.0, top-p 0.95, top-k 20, request seed 20260815,
-  engine seed 0. The accepted final run uses the unmodified native sampler.
+  engine seed 0. The 2026-08-23 recovery baseline uses the unmodified native
+  sampler. The 2026-08-24 acceptance uses the separately registered,
+  exact-Philox chunked sampler described below.
 - Pure decode uses the 255 steady token intervals and excludes TTFT/prefill.
 
 ## Route Map
@@ -70,8 +74,8 @@ length. Relative to the immediately preceding clean-p128 control, the
 pre-merge p64 run saves 0.365 ms/token and improves pure decode by 2.61%.
 After merging `onecat/main` at `675a12dedc`, rebuilding Flash-V100, and
 repeating the frozen request under an exclusive four-GPU reservation, p64
-measures 71.342 tok/s at 14.017 ms/token. This merged-source confirmation is
-the conservative final speed claim.
+measures 71.342 tok/s at 14.017 ms/token. This is the conservative 2026-08-23
+baseline and is superseded by the 2026-08-24 acceptance below.
 
 Sampled token identity is not an attention quality criterion: one-output-ULP
 changes can flip a low-margin random sample. The final p64 stream is coherent
@@ -151,11 +155,11 @@ XQA counter evidence.
   exact shapes use split 3/swizzle 4 with shape-specific lookahead.
 - QPN8 split 17/20/24 lost. Split 12 won only for K1536 x N5120, saving about
   12.7 us/token across the 64 output projections.
-- A compact top-k20 Python sampler reduced traced sampler service, but its
-  random-sampling trajectory was not deterministic against the native route.
-  A fused CUDA top20 candidate had the same acceptance problem. Both were
-  removed from production source; both final p64 results use the native
-  sampler.
+- The first compact top-k20 Python sampler and first fused CUDA top20
+  candidate did not preserve native Philox sampling and were removed. Both
+  2026-08-23 p64 results use the native sampler. They are distinct from the
+  later canonicalized, generator-state-preserving implementation accepted on
+  2026-08-24.
 - Replacing only the full-vocabulary sort while retaining both native
   full-vocabulary softmax operations saved 53.9 us in isolation, insufficient
   for a stable acceptance margin. A one-full-softmax hybrid stayed
@@ -179,3 +183,133 @@ XQA counter evidence.
   `final_merged_qwen38_nvfp4_tm_e4m3_xqa_p64_native_sampler_full_graph_i1k_o256.json`,
   `e4m3_xqa_p64_vs_p128_clean.json`, and the parsed per-token Nsight tables
   under `profiles/`.
+
+## 2026-08-24 No-MTP 80 tok/s Acceptance
+
+### Accepted deployment and route
+
+The accepted deployment is deliberately a three-binary composition. It uses
+the compatible primary `_C` module with SHA256
+`a0a0cd9ddeccc73fa3d920c7a869450c4b33d001f97637c35b75b966d89ad36d`,
+the production CMake C++17 sampler sidecar with SHA256
+`cdbfdd87dfa9119e52acc88d5787063202561a879a63334145a5616344a549ae`,
+and Flash-V100 p64 with SHA256
+`b418fed86b9c1ab9297c8795c24732818239b9a3aaca5ec9efb60933853d8ce7`.
+MTP remains disabled.
+
+The exact FP8 gate/up, down, and output shapes stay on the proven-faster QPN8
+route. GDN input, full-attention QKV, and the LM head stay on TurboMind W8A16.
+The accepted batch-one NVFP4 shapes use the native QPN4 decode route; unsupported
+or non-admitted cases retain the TurboMind fallback. Thus every eligible FP8
+sublayer still uses TurboMind unless the frozen shape has a measured faster
+QPN8 specialization.
+
+The sampler sidecar replaces a full-vocabulary sampling fragment with an
+80-chunk top-20 reduction while preserving canonical sort order, top-p math,
+Philox draws, and generator state. It is built separately so sampler operator
+registration does not relink the quality- and speed-frozen primary `_C`.
+`setup.py` extracts either CPython-SOABI or abi3 sidecar names, and
+`vllm/_sm70_ops.py` loads the bundled module or the explicitly configured
+`VLLM_SM70_SAMPLER_LIBRARY`.
+
+### Speed result
+
+All absolute results use the frozen TP4, input-1024/output-256 contract and
+255 steady decode intervals. TTFT and prefill are excluded.
+
+| Binary/measurement | Steady decode | TPOT | Disposition |
+|---|---:|---:|---|
+| Merged native-sampler baseline | 71.342 tok/s | 14.017 ms | baseline |
+| Hand sidecar repeat A2 | 80.177 tok/s | 12.472 ms | accepted |
+| Hand sidecar repeat A3 | 80.164 tok/s | 12.474 ms | accepted |
+| Hand sidecar repeat A4, physical GPUs 4-7 | 80.026 tok/s | 12.496 ms | accepted |
+| Production CMake C++17 sidecar A2 | **80.624 tok/s** | **12.403 ms** | accepted |
+
+The hand-sidecar accepted repeats preserve the frozen 256-token SHA256
+`0b2d335ddce9b282e45eea1b6c86525bc61eeb5ba1655e8228e6ef3bd1ce823b`.
+The production C++17 sidecar changes a low-margin full-model random trajectory,
+so random token identity is not treated as the sole quality gate. A direct
+cross-build sampler diagnostic covers 100 independent seeds and 256 sequential
+draws: hand and production sidecars produce identical token selections and
+identical final generator-state SHA256
+`4257d205138503840fea92fe6b15ddfa276df82c315513da4bbd785393c98c96`.
+
+### Output-quality gate
+
+The quality contract is the frozen first 250 GSM8K test questions, five-shot
+prompting, greedy generation, maximum 256 output tokens, and per-question
+record retention. It is intentionally independent of the random performance
+prompt.
+
+| Route | Correct | Accuracy | Invalid |
+|---|---:|---:|---:|
+| Frozen pre-optimization baseline | 226/250 | 90.4% | 0 |
+| Hand-sidecar candidate | 227/250 | 90.8% | 0 |
+| Production CMake C++17 sidecar | **226/250** | **90.4%** | **0** |
+
+The production result therefore equals the frozen accuracy baseline with no
+invalid outputs. Its JSON contains all questions, generated texts, extracted
+answers, labels, correctness flags, token IDs, and per-item output hashes. The
+result file SHA256 is
+`143b2b345b830a858bff2568f9cf51148c8185acb42bb129e2dfc2d421a196d2`.
+
+### Accepted-route trace and resource use
+
+The latest Nsight Systems trace uses the accepted compatible main library and
+the behavior-equivalent hand sidecar. It captures 63 graph replays on each of
+four ranks and reports the middle 61 steps. Its 13.465 ms node-traced TPOT is
+composition evidence; the unprofiled 12.474 ms result remains the absolute
+speed evidence. Graph-node kernel coverage is 94.88%.
+
+| Critical component | GPU service/token |
+|---|---:|
+| QPN8 split-16 projections | 2.213 ms |
+| QPN4 fused gate/up | 2.165 ms |
+| TP4 pack32 all-reduce | 1.587 ms |
+| QPN4 down | 1.441 ms |
+| QPN8 output projection | 0.915 ms |
+| Flash-V100 E4M3 XQA p64 | 0.618 ms |
+| QPN8 fused gate/up | 0.496 ms |
+| TurboMind FP8 dense/LM head | 0.410 ms |
+
+The mean replay interval is 13.430 ms and GPU activity union is 12.887 ms,
+or 95.958%; idle gaps total 0.543 ms/token and the largest mean gap is only
+9.538 us. The route still launches 1061.9 kernels per rank per token. The
+grid-limited occupancy ceiling assigns 38.46% of service below 25% occupancy,
+47.86% at 25-50%, and 13.63% at 50-75%, showing that batch-one kernel geometry
+and the serial projection/communication chain remain the main headroom.
+
+NVML's coarse windows report 100% GPU-busy duty, 53.25% memory-active duty,
+and 56.36% of the 300 W power limit. Runtime memory is about 28.97 GiB/GPU;
+SM and memory clocks are 1530 and 877 MHz. These are duty indicators, not
+achieved SM, Tensor Core, or HBM throughput. Nsight Compute counters remain
+unavailable because the driver returns `ERR_NVGPUCTRPERM`. A payload-only
+model estimate is about 491 GB/s/GPU and useful arithmetic is about 4.33
+TFLOP/s across TP4, but neither value is a hardware-counter measurement.
+
+### Reproducibility boundary and evidence
+
+The production sidecar is reproducible through the CMake target
+`_sm70_sampler_C` and its focused microbenchmark selects exactly the reference
+tokens across five distributions, 100 explicit-seed trials, and 100 default
+generator trials. It reduces the measured fragment from 102.427 to 62.972 us.
+The final Python regression run passes all 94 tests in the sampler, NVFP4
+admission, and SM70 TurboMind adapter files. Ruff lint/format, Python byte
+compilation, the sidecar wheel-name gate, and `git diff --check` also pass.
+
+Freshly relinking the primary `_C` was tested separately. Even after matching
+the accepted CUDA cubins for QPN8, QPN4, and custom all-reduce, fresh main
+libraries measured roughly 77-80 tok/s and changed the low-margin random stream.
+Those main-library builds are rejected; do not substitute them for the
+compatible `_C` SHA above until the remaining host/link reproducibility issue
+is resolved. Keeping the sampler in its own sidecar is the accepted packaging
+boundary.
+
+Primary evidence paths are:
+
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/candidate_qpn4_fold_qpn8_m1_arpack32_official_cxx17_sidecar_chunk80_i1k_o256_a2.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/qwen38_nvfp4_gsm8k_250_official_cxx17_sidecar.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/sampler_stream_hand.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/results/sampler_stream_cxx17.json`
+- `.artifacts/qwen38_nvfp4_speed_20260823/profiles/candidate_qwen38_nvfp4_sidecar_chunk80_nsys_nvml_i1k_o64_per_token.md`
+- `.artifacts/qwen38_nvfp4_speed_20260823/profiles/candidate_qwen38_nvfp4_sidecar_chunk80_resource_summary.md`

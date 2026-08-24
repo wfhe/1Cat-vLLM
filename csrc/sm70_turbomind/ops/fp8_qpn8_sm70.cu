@@ -170,13 +170,14 @@ __global__ void fp8_qpn8_silu_and_mul_sm70_kernel(
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes>
+template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
+          bool M1Only = false>
 __global__ void fp8_qpn8_sm70_kernel(const uint8_t* __restrict__ codes,
                                      const half* __restrict__ group_scales,
                                      const half* __restrict__ input,
                                      half* __restrict__ output, int n, int k,
                                      int m, bool channel_scales) {
-  __shared__ float partials[SplitK][256];
+  __shared__ float partials[SplitK][M1Only ? 32 : 256];
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -271,44 +272,70 @@ __global__ void fp8_qpn8_sm70_kernel(const uint8_t* __restrict__ codes,
     }
   }
 
+  if constexpr (M1Only) {
+    if ((lane & 17) == 0) {
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int output_col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-    partials[warp][output_row * 32 + quadpair * 8 + output_col] = accum[0][i];
+      for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+        for (int offset = 0; offset < 2; ++offset) {
+          const int i = pair * 4 + offset;
+          const int output_col =
+              offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+          partials[warp][quadpair * 8 + output_col] = accum[0][i];
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int output_row =
+          (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int output_col =
+          (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partials[warp][output_row * 32 + quadpair * 8 + output_col] =
+          accum[0][i];
+    }
   }
   __syncthreads();
 
-  for (int element = threadIdx.x; element < 256; element += blockDim.x) {
+  constexpr int kOutputElements = M1Only ? 32 : 256;
+  for (int element = threadIdx.x; element < kOutputElements;
+       element += blockDim.x) {
     float value = 0.0f;
 #pragma unroll
     for (int k_warp = 0; k_warp < SplitK; ++k_warp) {
       value += partials[k_warp][element];
     }
-    const int output_row = element >> 5;
-    const int output_col = element & 31;
-    if (output_row < m) {
-      output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
-          __float2half(value);
+    if constexpr (M1Only) {
+      output[tile * 32 + element] = __float2half(value);
+    } else {
+      const int output_row = element >> 5;
+      const int output_col = element & 31;
+      if (output_row < m) {
+        output[static_cast<size_t>(output_row) * n + tile * 32 + output_col] =
+            __float2half(value);
+      }
     }
   }
 }
 
-template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes>
+template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
+          bool M1Only = false>
 void launch_fp8_qpn8_sm70(const uint8_t* codes, const half* group_scales,
                           const half* input, half* output, int n, int k, int m,
                           bool channel_scales, cudaStream_t stream) {
-  fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes>
+  fp8_qpn8_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes, M1Only>
       <<<(n / 32), (32 * SplitK), 0, stream>>>(codes, group_scales, input,
                                                output, n, k, m, channel_scales);
 }
 
-template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes>
+template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
+          bool M1Only = false>
 __global__ void fp8_qpn8_gated_pair_sm70_kernel(
     const uint8_t* __restrict__ codes, const half* __restrict__ group_scales,
     const half* __restrict__ input, half* __restrict__ output, int hidden,
     int k, int m, bool channel_scales) {
-  __shared__ float partials[2][SplitK][256];
+  __shared__ float partials[2][SplitK][M1Only ? 32 : 256];
 
   const int lane = threadIdx.x & 31;
   const int warp_in_block = threadIdx.x >> 5;
@@ -403,16 +430,36 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
       accum[0][i] += accum[chain][i];
     }
   }
+  if constexpr (M1Only) {
+    if ((lane & 17) == 0) {
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int output_row = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int output_col = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-    partials[projection][warp][output_row * 32 + quadpair * 8 + output_col] =
-        accum[0][i];
+      for (int pair = 0; pair < 2; ++pair) {
+#pragma unroll
+        for (int offset = 0; offset < 2; ++offset) {
+          const int i = pair * 4 + offset;
+          const int output_col =
+              offset | (((lane >> 1) & 1) << 1) | (pair << 2);
+          partials[projection][warp][quadpair * 8 + output_col] =
+              accum[0][i];
+        }
+      }
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int output_row =
+          (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int output_col =
+          (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partials[projection][warp]
+              [output_row * 32 + quadpair * 8 + output_col] = accum[0][i];
+    }
   }
   __syncthreads();
 
-  for (int element = threadIdx.x; element < 256; element += blockDim.x) {
+  constexpr int kOutputElements = M1Only ? 32 : 256;
+  for (int element = threadIdx.x; element < kOutputElements;
+       element += blockDim.x) {
     float gate = 0.0f;
     float up = 0.0f;
 #pragma unroll
@@ -420,23 +467,30 @@ __global__ void fp8_qpn8_gated_pair_sm70_kernel(
       gate += partials[0][k_warp][element];
       up += partials[1][k_warp][element];
     }
-    const int output_row = element >> 5;
-    const int output_col = element & 31;
-    if (output_row < m) {
+    if constexpr (M1Only) {
       const float silu = gate / (1.0f + __expf(-gate));
-      output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
-             output_col] = __float2half(silu * up);
+      output[blockIdx.x * 32 + element] = __float2half(silu * up);
+    } else {
+      const int output_row = element >> 5;
+      const int output_col = element & 31;
+      if (output_row < m) {
+        const float silu = gate / (1.0f + __expf(-gate));
+        output[static_cast<size_t>(output_row) * hidden + blockIdx.x * 32 +
+               output_col] = __float2half(silu * up);
+      }
     }
   }
 }
 
-template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes>
+template <int SplitK, int NAcc, bool FastDecoder, bool PrefetchCodes,
+          bool M1Only = false>
 void launch_fp8_qpn8_gated_pair_sm70(const uint8_t* codes,
                                      const half* group_scales,
                                      const half* input, half* output,
                                      int hidden, int k, int m,
                                      bool channel_scales, cudaStream_t stream) {
-  fp8_qpn8_gated_pair_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes>
+  fp8_qpn8_gated_pair_sm70_kernel<SplitK, NAcc, FastDecoder, PrefetchCodes,
+                                  M1Only>
       <<<(hidden / 32), (64 * SplitK), 0, stream>>>(codes, group_scales, input,
                                                     output, hidden, k, m,
                                                     channel_scales);
@@ -655,8 +709,26 @@ void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
 
+  // Keep the M=1 reduction order restricted to the two tuned output/down
+  // projections. Extending it to the other split variants changed the frozen
+  // random-sampling token stream without an end-to-end decode win.
+  if (m == 1 && accumulator_chains == 2 && fast_decoder &&
+      !prefetch_codes && (split_k == 12 || split_k == 16)) {
+    if (split_k == 12) {
+      launch_fp8_qpn8_sm70<12, 2, true, false, true>(
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
+          static_cast<int>(k), 1, channel_scales, stream);
+    } else {
+      launch_fp8_qpn8_sm70<16, 2, true, false, true>(
+          code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),
+          static_cast<int>(k), 1, channel_scales, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
 #define VLLM_LAUNCH_QPN8(SPLIT, NACC, FAST, PREFETCH)                  \
-  launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH>(                   \
+  launch_fp8_qpn8_sm70<SPLIT, NACC, FAST, PREFETCH, false>(            \
       code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n), \
       static_cast<int>(k), static_cast<int>(m), channel_scales, stream)
 
@@ -778,8 +850,20 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
       reinterpret_cast<const half*>(input.data_ptr<at::Half>());
   auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
 
+  // The frozen gate/up route is split-8. Preserve the generic reduction order
+  // for split-4/16 rather than instantiating unaccepted M=1 variants.
+  if (m == 1 && split_k == 8 && accumulator_chains == 2 && fast_decoder &&
+      !prefetch_codes) {
+    launch_fp8_qpn8_gated_pair_sm70<8, 2, true, false, true>(
+        code_ptr, scale_ptr, input_ptr, output_ptr,
+        static_cast<int>(hidden), static_cast<int>(k), 1, channel_scales,
+        stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+
 #define VLLM_LAUNCH_QPN8_GATED_PAIR(SPLIT, NACC, FAST, PREFETCH)            \
-  launch_fp8_qpn8_gated_pair_sm70<SPLIT, NACC, FAST, PREFETCH>(             \
+  launch_fp8_qpn8_gated_pair_sm70<SPLIT, NACC, FAST, PREFETCH, false>(      \
       code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(hidden), \
       static_cast<int>(k), static_cast<int>(m), channel_scales, stream)
 

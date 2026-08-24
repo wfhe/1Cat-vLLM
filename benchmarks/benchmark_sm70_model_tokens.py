@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
-FLASH_V100_ROOT = SOURCE_ROOT / "flash-attention-v100"
+FLASH_V100_ROOT = Path(
+    os.environ.get("SM70_FLASH_V100_ROOT", SOURCE_ROOT / "flash-attention-v100")
+)
 for source_path in (FLASH_V100_ROOT, SOURCE_ROOT):
     source_path_str = str(source_path)
     if source_path_str not in sys.path:

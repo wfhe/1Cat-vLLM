@@ -298,14 +298,20 @@ def _iter_unique_fp8_dense_layers(
 
 
 def _iter_unique_fp4_dense_layers(model: torch.nn.Module) -> Iterable[Any]:
-    seen: set[tuple[str, int, int, int]] = set()
+    seen: set[tuple[str, int, int, int, bool]] = set()
     for layer in model.modules():
         state = getattr(layer, sm70_tm.STATE_ATTR, None)
         if state is None or state.op_kind not in ("mxfp4", "nvfp4"):
             continue
         k_dim = int(state.weight.shape[0])
         n_dim = int(state.output_size)
-        key = (state.op_kind, k_dim, n_dim, int(state.group_size))
+        key = (
+            state.op_kind,
+            k_dim,
+            n_dim,
+            int(state.group_size),
+            bool(state.gated_silu),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -474,7 +480,8 @@ def _warmup_fp4_dense_layers(
     for state in dense_layers:
         device = state.weight.device
         k_dim = int(state.weight.shape[0])
-        n_dim = int(state.output_size)
+        gated_silu = bool(state.gated_silu)
+        n_dim = int(state.output_size) // (2 if gated_silu else 1)
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
@@ -489,7 +496,7 @@ def _warmup_fp4_dense_layers(
                     int(state.group_size),
                     int(state.k_ld),
                     int(state.q_ld),
-                    False,
+                    gated_silu,
                 )
             elif state.op_kind == "nvfp4":
                 if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
@@ -502,7 +509,7 @@ def _warmup_fp4_dense_layers(
                     int(state.group_size),
                     int(state.k_ld),
                     int(state.q_ld),
-                    False,
+                    gated_silu,
                 )
             else:
                 continue

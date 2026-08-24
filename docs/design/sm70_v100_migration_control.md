@@ -41746,3 +41746,51 @@ Interpretation:
 - Full contract, route map, staged results, profile table, numerical evidence,
   rejected paths, rollback controls, and artifacts are in
   `docs/design/sm70_qwen38_nvfp4_decode.md`.
+
+## 2026-08-24 Qwen3.8-27B-NVFP4 TP4 no-MTP 80 tok/s acceptance
+
+- The frozen input-1024/output-256 TP4 contract now passes the requested
+  no-MTP speed gate. The production CMake C++17 sampler-sidecar run measures
+  **80.624 tok/s** at **12.403 ms/token**. Three behavior-equivalent hand
+  sidecar repeats measure 80.177, 80.164, and 80.026 tok/s, including a repeat
+  on physical GPUs 4-7. Pure decode excludes TTFT and prefill.
+- The deployment retains the proven-faster exact-shape QPN8 projections. GDN
+  input, full-attention QKV, and the LM head continue through TurboMind W8A16;
+  non-admitted NVFP4 cases retain TurboMind fallback. The accepted batch-one
+  NVFP4 shapes use native QPN4, E4M3 attention uses Flash-V100 XQA p64, and TP4
+  communication uses the pack32 one-stage all-reduce. MTP is disabled.
+- The quality gate passes at the frozen baseline: the production sidecar scores
+  **226/250 (90.4%)** on the first 250 GSM8K questions with five-shot greedy
+  prompting and has zero invalid outputs. The baseline is also 226/250; the
+  hand-sidecar result is 227/250. Per-question prompts, texts, token IDs,
+  extracted answers, labels, correctness, and hashes are retained in the JSON.
+- The production sidecar and hand-built validation library select identical
+  tokens for 100 independent seeds and 256 sequential Philox draws and finish
+  with the same generator state. This exact implementation supersedes the
+  earlier rejected compact/fused sampler experiments, which did not preserve
+  native Philox behavior.
+- The accepted compatible main `_C`, production sampler sidecar, and
+  Flash-V100 SHA256 values are `a0a0cd9...d36d`, `cdbfdd87...9ae`, and
+  `b418fed8...dce7`. The sampler is intentionally a separate CMake/wheel module
+  so registering it does not relink the frozen main library.
+- The latest 63-replay/rank Nsight Systems trace shows a 13.430 ms mean replay
+  interval, 12.887 ms GPU activity union (95.958%), 0.543 ms idle, and 1061.9
+  launches/rank/token. QPN8 split-16, QPN4 gate/up, TP all-reduce, QPN4 down,
+  QPN8 output, XQA, QPN8 gate/up, and TurboMind FP8 service contribute 2.213,
+  2.165, 1.587, 1.441, 0.915, 0.618, 0.496, and 0.410 ms/token respectively.
+- NVML reports 100% busy-window duty, 53.25% memory-active duty, about 28.97
+  GiB allocated per GPU, and 56.36% of the 300 W limit. Grid-limited occupancy
+  ceilings put 86.32% of service below 50% occupancy. These are not achieved
+  SM/Tensor/HBM counters; Nsight Compute remains blocked by
+  `ERR_NVGPUCTRPERM`.
+- Fresh primary `_C` relinks remain rejected even when the relevant CUDA cubins
+  match: observed speed is roughly 77-80 tok/s and the low-margin random stream
+  changes. Until the host/link reproducibility difference is closed, the
+  compatible main SHA above plus the production sidecar is the acceptance
+  boundary. This prevents a source rebuild from being mistaken for validated
+  deployment evidence.
+- Final focused regressions pass 94/94 sampler, NVFP4-admission, and SM70
+  TurboMind-adapter tests. Ruff lint/format, Python byte compilation, the
+  sidecar wheel filename gate, and `git diff --check` also pass.
+- Full results, route details, quality artifacts, trace/resource tables, and
+  exact evidence paths are in `docs/design/sm70_qwen38_nvfp4_decode.md`.

@@ -6909,6 +6909,26 @@ class GPUModelRunner(
         _maybe_dump_sm70_qwen_layer_graph_buffers("pre_sample")
         _maybe_sync_sm70_sample_tensors(sample_hidden_states)
         if spec_decode_metadata is None:
+            if logits is None and self._can_use_sm70_compact_topk20_tokens(
+                scheduler_output, spec_decode_metadata
+            ):
+                topk_token_ids, topk_logits = self.model.get_topk_tokens_and_logits(
+                    sample_hidden_states,
+                    20,
+                )
+                compact_sampled = self.sampler.sm70_compact_topk20_pairs_sample(
+                    topk_logits,
+                    topk_token_ids,
+                    sampling_metadata,
+                )
+                if compact_sampled is not None:
+                    logger.info_once(
+                        "SM70 TP-local exact top-k20 random sampling path enabled."
+                    )
+                    return SamplerOutput(
+                        sampled_token_ids=compact_sampled.to(torch.int32).unsqueeze(-1),
+                        logprobs_tensors=None,
+                    )
             sampler_output = self._sample_greedy_token_fastpath(
                 logits,
                 sampling_metadata,
@@ -7457,6 +7477,88 @@ class GPUModelRunner(
             self._trace_greedy_token_fastpath("logits_processor")
             return False
         self._trace_greedy_token_fastpath("enabled")
+        return True
+
+    def _can_use_sm70_compact_topk20_tokens(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        if not envs.VLLM_SM70_COMPACT_TOPK20_SAMPLER:
+            return False
+        if not envs.VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER:
+            return False
+        if spec_decode_metadata is not None:
+            return self._reject_sm70_compact_topk20_tokens("spec_decode")
+        if self.is_pooling_model or self.broadcast_pp_output:
+            return self._reject_sm70_compact_topk20_tokens("pooling_or_pp_broadcast")
+        if scheduler_output.has_structured_output_requests:
+            return self._reject_sm70_compact_topk20_tokens("structured_output")
+        if self.device.type != "cuda":
+            return self._reject_sm70_compact_topk20_tokens("non_cuda")
+        if torch.cuda.get_device_capability(self.device) != (7, 0):
+            return self._reject_sm70_compact_topk20_tokens("non_sm70")
+        if self.model_config.get_vocab_size() != 248320:
+            return self._reject_sm70_compact_topk20_tokens("vocab_size")
+        if not hasattr(self.model, "get_topk_tokens_and_logits"):
+            return self._reject_sm70_compact_topk20_tokens("missing_model_topk")
+        if self.input_batch.num_reqs != 1:
+            return self._reject_sm70_compact_topk20_tokens("batch_size")
+
+        sampling_metadata = self.input_batch.sampling_metadata
+        if not sampling_metadata.all_random or sampling_metadata.all_greedy:
+            return self._reject_sm70_compact_topk20_tokens("sampling_mode")
+        if sampling_metadata.max_num_logprobs is not None:
+            return self._reject_sm70_compact_topk20_tokens("logprobs")
+        if sampling_metadata.logprob_token_ids:
+            return self._reject_sm70_compact_topk20_tokens("logprob_token_ids")
+        if not sampling_metadata.no_penalties:
+            return self._reject_sm70_compact_topk20_tokens("penalties")
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            return self._reject_sm70_compact_topk20_tokens("allowed_token_ids")
+        if sampling_metadata.bad_words_token_ids:
+            return self._reject_sm70_compact_topk20_tokens("bad_words")
+        holder = sampling_metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return self._reject_sm70_compact_topk20_tokens("thinking_budget")
+        if not self._non_argmax_logits_processors_inactive(sampling_metadata):
+            return self._reject_sm70_compact_topk20_tokens("logits_processor")
+        if not self._sm70_argmax_logits_processors_inactive(sampling_metadata):
+            return self._reject_sm70_compact_topk20_tokens(
+                "argmax_invariant_logits_processor"
+            )
+        if sampling_metadata.top_k_cpu != (20,):
+            return self._reject_sm70_compact_topk20_tokens("top_k")
+
+        top_p_cpu = sampling_metadata.top_p_cpu
+        if top_p_cpu is None or len(top_p_cpu) != 1 or abs(top_p_cpu[0] - 0.95) > 1e-6:
+            return self._reject_sm70_compact_topk20_tokens("top_p")
+        temperature_cpu = sampling_metadata.temperature_cpu
+        if (
+            temperature_cpu is None
+            or len(temperature_cpu) != 1
+            or abs(temperature_cpu[0] - 1.0) > 1e-6
+        ):
+            return self._reject_sm70_compact_topk20_tokens("temperature")
+        return True
+
+    @staticmethod
+    def _reject_sm70_compact_topk20_tokens(reason: str) -> bool:
+        logger.info_once("SM70 TP-local top-k20 route rejected: %s", reason)
+        return False
+
+    @staticmethod
+    def _sm70_argmax_logits_processors_inactive(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        from vllm.v1.sample.logits_processor.builtin import MinPLogitsProcessor
+
+        for processor in sampling_metadata.logitsprocs.argmax_invariant:
+            if isinstance(processor, MinPLogitsProcessor):
+                if processor.min_p_count:
+                    return False
+                continue
+            return False
         return True
 
     def _trace_greedy_token_fastpath(self, reason: str) -> None:
@@ -8457,6 +8559,9 @@ class GPUModelRunner(
                 mtp_logits_start = self._sm70_mtp_profile_start(mtp_profile_events)
                 if (
                     self._can_use_greedy_token_fastpath(
+                        scheduler_output, spec_decode_metadata
+                    )
+                    or self._can_use_sm70_compact_topk20_tokens(
                         scheduler_output, spec_decode_metadata
                     )
                     or self._can_use_ddtree_greedy_top_tokens(

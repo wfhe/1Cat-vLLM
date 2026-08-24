@@ -275,6 +275,37 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &fp8_qpn8_gated_pair_sm70_out);
 
   ops.def(
+      "nvfp4_qpn4_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
+  ops.impl("nvfp4_qpn4_prepare_sm70", torch::kCUDA,
+           &nvfp4_qpn4_prepare_sm70);
+
+  ops.def(
+      "nvfp4_qpn4_prepare_scale_code_sm70(Tensor qweight, Tensor "
+      "scale_codes) -> Tensor[]");
+  ops.impl("nvfp4_qpn4_prepare_scale_code_sm70", torch::kCUDA,
+           &nvfp4_qpn4_prepare_scale_code_sm70);
+
+  ops.def(
+      "nvfp4_qpn4_dequantize_sm70_out(Tensor(a!) out, Tensor codes, Tensor "
+      "scales, float global_scale, bool use_scale_code) -> ()");
+  ops.impl("nvfp4_qpn4_dequantize_sm70_out", torch::kCUDA,
+           &nvfp4_qpn4_dequantize_sm70_out);
+
+  ops.def(
+      "nvfp4_qpn4_prefill_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor scales, float global_scale, bool "
+      "use_scale_code, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn4_prefill_sm70_out", torch::kCUDA,
+           &nvfp4_qpn4_prefill_sm70_out);
+
+  ops.def(
+      "nvfp4_qpn4_dispatch_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor scales, float global_scale, bool "
+      "use_scale_code, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn4_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn4_dispatch_sm70_out);
+
+  ops.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
       "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
