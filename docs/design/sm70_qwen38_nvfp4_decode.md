@@ -293,9 +293,11 @@ The production sidecar is reproducible through the CMake target
 `_sm70_sampler_C` and its focused microbenchmark selects exactly the reference
 tokens across five distributions, 100 explicit-seed trials, and 100 default
 generator trials. It reduces the measured fragment from 102.427 to 62.972 us.
-The final Python regression run passes all 94 tests in the sampler, NVFP4
-admission, and SM70 TurboMind adapter files. Ruff lint/format, Python byte
-compilation, the sidecar wheel-name gate, and `git diff --check` also pass.
+The final Python regression run passes all 94 target tests in the sampler,
+NVFP4 admission, and SM70 TurboMind adapter files. After merging the adjacent
+ModelOpt work, the combined four-file run passes 106/106. Ruff lint/format,
+Python byte compilation, the sidecar wheel-name gate, and `git diff --check`
+also pass.
 
 Freshly relinking the primary `_C` was tested separately. Even after matching
 the accepted CUDA cubins for QPN8, QPN4, and custom all-reduce, fresh main
